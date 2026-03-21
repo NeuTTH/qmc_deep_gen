@@ -81,7 +81,7 @@ def test_epoch(model,loader,base_sequence,loss_function,conditional=False,random
     return epoch_losses
 
 def train_loop(model,loader,base_sequence,loss_function,nEpochs=100,verbose=False,
-               random=True,mod=True,conditional=False,importance_weights=[]):
+               random=True,mod=True,conditional=False,importance_weights=[],print_gpu_mem=False):
 
     optimizer = Adam(model.parameters(),lr=1e-3)
     losses = []
@@ -89,7 +89,7 @@ def train_loop(model,loader,base_sequence,loss_function,nEpochs=100,verbose=Fals
 
         if verbose:
             batch_loss,model,optimizer = train_epoch_verbose(model,optimizer,loader,base_sequence,loss_function,
-                                                 random=random,mod=mod,conditional=conditional,importance_weights=importance_weights)    
+                                                 random=random,mod=mod,conditional=conditional,importance_weights=importance_weights)
         else:
             batch_loss,model,optimizer = train_epoch(model,optimizer,loader,base_sequence,loss_function,
                                                  random=random,mod=mod,conditional=conditional,importance_weights=importance_weights)
@@ -97,6 +97,11 @@ def train_loop(model,loader,base_sequence,loss_function,nEpochs=100,verbose=Fals
         losses += batch_loss
         if verbose:
             print(f'Epoch {epoch + 1} Average loss: {np.sum(batch_loss)/len(loader.dataset):.4f}')
+        if print_gpu_mem and torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**2
+            reserved  = torch.cuda.memory_reserved()  / 1024**2
+            peak      = torch.cuda.max_memory_allocated() / 1024**2
+            print(f"  [GPU epoch {epoch+1}] allocated={allocated:.1f}MB  reserved={reserved:.1f}MB  peak={peak:.1f}MB")
 
     return model, optimizer,losses
 

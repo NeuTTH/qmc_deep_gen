@@ -212,7 +212,13 @@ def gaussian_lp(samples,data,var,importance_weights=[]):
         importance_weights = torch.ones((1,K),device=samples.device,dtype=torch.float32)
     #lambda_lp = lambda samples,data: -torch.nn.functional.gaussian_nll_loss(samples,data,var=var,reduction='sum',full=True)
     vmapped_lp = torch.vmap(torch.vmap(gaussian_nll_loss,in_dims=(0,None)),in_dims=(None,0))
-    return -vmapped_lp(samples,data,var=var,reduction='sum',full=True) + torch.log(importance_weights) # since this should be log(p(x|z)p(z))
+    var_tensor = torch.tensor(var, device=samples.device, dtype=samples.dtype) if not isinstance(var, torch.Tensor) else var
+    # print(f"[DEBUG gaussian_lp] samples.shape={samples.shape} data.shape={data.shape} var_tensor={var_tensor} var_tensor.shape={var_tensor.shape} importance_weights.shape={importance_weights.shape}")
+    # gaussian_nll_loss requires var to match input shape or be (batch,1); after vmap strips dims,
+    # inner call sees samples[s] shape={samples.shape[1:]} and needs var of same shape or (1,)
+    var_expanded = var_tensor.expand(samples.shape[1:])
+    # print(f"[DEBUG gaussian_lp] var_expanded.shape={var_expanded.shape} (should match {samples.shape[1:]})")
+    return -vmapped_lp(samples,data,var=var_expanded,reduction='sum',full=True) + torch.log(importance_weights) # since this should be log(p(x|z)p(z))
 
 
 def gaussian_lp_old(samples,data,var=1):

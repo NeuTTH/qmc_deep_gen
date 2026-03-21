@@ -1,0 +1,22 @@
+activate the default environment with 'conda activate' or create a new environment to customize with 'conda create'.
+/mnt/cup/people/tt1131/projects/MMMmB/qmc_deep_gen/data/mouse_data.py:205: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  train_dict = torch.load(os.path.join(data_dir, 'train_data.pt'))
+/mnt/cup/people/tt1131/projects/MMMmB/qmc_deep_gen/data/mouse_data.py:206: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  val_dict   = torch.load(os.path.join(data_dir, 'val_data.pt'))
+Creating save directory: /usr/people/tt1131/projects/MMMmB/qmc_deep_gen/results/mouse_test_small_50k
+Traceback (most recent call last):
+  File "/usr/people/tt1131/projects/MMMmB/qmc_deep_gen/bartul_mouse.py", line 114, in <module>
+    fire.Fire(run_mouse_experiments)
+  File "/usr/people/tt1131/.conda/envs/samv2_env/lib/python3.10/site-packages/fire/core.py", line 135, in Fire
+    component_trace = _Fire(component, args, parsed_flag_args, context, name)
+  File "/usr/people/tt1131/.conda/envs/samv2_env/lib/python3.10/site-packages/fire/core.py", line 468, in _Fire
+    component, remaining_args = _CallAndUpdateTrace(
+  File "/usr/people/tt1131/.conda/envs/samv2_env/lib/python3.10/site-packages/fire/core.py", line 684, in _CallAndUpdateTrace
+    component = fn(*varargs, **kwargs)
+  File "/usr/people/tt1131/projects/MMMmB/qmc_deep_gen/bartul_mouse.py", line 32, in run_mouse_experiments
+    train_ds = mouse_data(train_dict, max_samples=max_train_samples)
+  File "/mnt/cup/people/tt1131/projects/MMMmB/qmc_deep_gen/data/mouse_data.py", line 231, in __init__
+    print_masks_len_stats(masks_len, label='Full dataset')                                                         
+  File "/mnt/cup/people/tt1131/projects/MMMmB/qmc_deep_gen/data/mouse_data.py", line 288, in print_masks_len_stats
+    unique, counts = torch.unique(masks_len, return_counts=True)                                                       
+NameError: name 'torch' is not defined

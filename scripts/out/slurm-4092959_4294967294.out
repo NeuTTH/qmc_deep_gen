@@ -1,0 +1,99 @@
+activate the default environment with 'conda activate' or create a new environment to customize with 'conda create'.
+/mnt/cup/people/tt1131/projects/MMMmB/qmc_deep_gen/data/mouse_data.py:206: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  train_dict = torch.load(os.path.join(data_dir, 'train_data.pt'))
+/mnt/cup/people/tt1131/projects/MMMmB/qmc_deep_gen/data/mouse_data.py:207: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  val_dict   = torch.load(os.path.join(data_dir, 'val_data.pt'))
+
+--- Full dataset (N=268223) ---
+ masks_len    count      pct
+         0      8400      3.1%
+         1    135695     50.6%
+         2     63498     23.7%
+         3     25989      9.7%
+         4     17125      6.4%
+         5      9135      3.4%
+         6      4697      1.8%
+         7      2222      0.8%
+         8       886      0.3%
+         9       390      0.1%
+        10       124      0.0%
+        11        44      0.0%
+        12        13      0.0%
+        13         3      0.0%
+        14         2      0.0%
+     total    268223  100.0%
+
+--- After filtering masks_len to [1, 8] (N=259247) ---
+ masks_len    count      pct
+         1    135695     52.3%
+         2     63498     24.5%
+         3     25989     10.0%
+         4     17125      6.6%
+         5      9135      3.5%
+         6      4697      1.8%
+         7      2222      0.9%
+         8       886      0.3%
+     total    259247  100.0%
+
+--- After stratified subsampling (max_samples=50000) (N=39055) ---
+ masks_len    count      pct
+         1      6250     16.0%
+         2      6250     16.0%
+         3      6250     16.0%
+         4      6250     16.0%
+         5      6250     16.0%
+         6      4697     12.0%
+         7      2222      5.7%
+         8       886      2.3%
+     total     39055  100.0%
+
+--- Full dataset (N=67391) ---
+ masks_len    count      pct
+         0      2058      3.1%
+         1     33961     50.4%
+         2     16105     23.9%
+         3      6739     10.0%
+         4      4152      6.2%
+         5      2259      3.4%
+         6      1164      1.7%
+         7       608      0.9%
+         8       215      0.3%
+         9        92      0.1%
+        10        21      0.0%
+        11        10      0.0%
+        12         4      0.0%
+        13         1      0.0%
+        14         1      0.0%
+        15         1      0.0%
+     total     67391  100.0%
+
+--- After filtering masks_len to [1, 8] (N=65203) ---
+ masks_len    count      pct
+         1     33961     52.1%
+         2     16105     24.7%
+         3      6739     10.3%
+         4      4152      6.4%
+         5      2259      3.5%
+         6      1164      1.8%
+         7       608      0.9%
+         8       215      0.3%
+     total     65203  100.0%
+Using train_batch_size=128, test_batch_size=1
+Device: cuda
+[GPU before model init] allocated=0.0MB  reserved=0.0MB  peak=0.0MB  total=40441.4MB
+[GPU after model init] allocated=32.1MB  reserved=34.0MB  peak=32.1MB  total=40441.4MB
+now training qmc model
+  0%|          | 0/100 [00:00<?, ?it/s]  1%|          | 1/100 [00:37<1:02:14, 37.72s/it]  [GPU epoch 1] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+  2%|▏         | 2/100 [01:12<58:25, 35.77s/it]    [GPU epoch 2] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+  3%|▎         | 3/100 [01:46<56:57, 35.24s/it]  [GPU epoch 3] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+  4%|▍         | 4/100 [02:21<56:00, 35.00s/it]  [GPU epoch 4] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+  5%|▌         | 5/100 [02:56<55:12, 34.87s/it]  [GPU epoch 5] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+  6%|▌         | 6/100 [03:30<54:21, 34.69s/it]  [GPU epoch 6] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+  7%|▋         | 7/100 [04:04<53:44, 34.68s/it]  [GPU epoch 7] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+  8%|▊         | 8/100 [04:39<53:12, 34.70s/it]  [GPU epoch 8] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+  9%|▉         | 9/100 [05:14<52:25, 34.56s/it]  [GPU epoch 9] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+ 10%|█         | 10/100 [05:48<51:40, 34.45s/it]  [GPU epoch 10] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+ 11%|█         | 11/100 [06:22<51:12, 34.52s/it]  [GPU epoch 11] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+ 12%|█▏        | 12/100 [06:57<50:35, 34.49s/it]  [GPU epoch 12] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+ 13%|█▎        | 13/100 [07:31<50:02, 34.51s/it]  [GPU epoch 13] allocated=144.9MB  reserved=29664.0MB  peak=24706.6MB
+slurmstepd: error: *** JOB 4092959 ON spockmk2-09 CANCELLED AT 2026-03-21T10:16:25 ***
