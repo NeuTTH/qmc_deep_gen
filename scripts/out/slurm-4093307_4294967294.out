@@ -1,0 +1,188 @@
+activate the default environment with 'conda activate' or create a new environment to customize with 'conda create'.
+/mnt/cup/people/tt1131/projects/MMMmB/qmc_deep_gen/data/mouse_data.py:205: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  train_dict = torch.load(os.path.join(data_dir, 'train_data.pt'))
+/mnt/cup/people/tt1131/projects/MMMmB/qmc_deep_gen/data/mouse_data.py:206: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  val_dict   = torch.load(os.path.join(data_dir, 'val_data.pt'))
+Creating save directory: /usr/people/tt1131/projects/MMMmB/qmc_deep_gen/results/mouse_test_small_80k_binary
+
+--- Full dataset (N=268223) ---
+ masks_len    count      pct
+         0      8400      3.1%
+         1    135695     50.6%
+         2     63498     23.7%
+         3     25989      9.7%
+         4     17125      6.4%
+         5      9135      3.4%
+         6      4697      1.8%
+         7      2222      0.8%
+         8       886      0.3%
+         9       390      0.1%
+        10       124      0.0%
+        11        44      0.0%
+        12        13      0.0%
+        13         3      0.0%
+        14         2      0.0%
+     total    268223  100.0%
+
+--- After filtering masks_len to [1, 8] (N=259247) ---
+ masks_len    count      pct
+         1    135695     52.3%
+         2     63498     24.5%
+         3     25989     10.0%
+         4     17125      6.6%
+         5      9135      3.5%
+         6      4697      1.8%
+         7      2222      0.9%
+         8       886      0.3%
+     total    259247  100.0%
+
+--- After equal sampling (max_samples=80000, per_bin=10000) (N=80000) ---
+ masks_len    count      pct
+         1     10000     12.5%
+         2     10000     12.5%
+         3     10000     12.5%
+         4     10000     12.5%
+         5     10000     12.5%
+         6     10000     12.5%
+         7     10000     12.5%
+         8     10000     12.5%
+     total     80000  100.0%
+
+--- Full dataset (N=67391) ---
+ masks_len    count      pct
+         0      2058      3.1%
+         1     33961     50.4%
+         2     16105     23.9%
+         3      6739     10.0%
+         4      4152      6.2%
+         5      2259      3.4%
+         6      1164      1.7%
+         7       608      0.9%
+         8       215      0.3%
+         9        92      0.1%
+        10        21      0.0%
+        11        10      0.0%
+        12         4      0.0%
+        13         1      0.0%
+        14         1      0.0%
+        15         1      0.0%
+     total     67391  100.0%
+
+--- After filtering masks_len to [1, 8] (N=65203) ---
+ masks_len    count      pct
+         1     33961     52.1%
+         2     16105     24.7%
+         3      6739     10.3%
+         4      4152      6.4%
+         5      2259      3.5%
+         6      1164      1.8%
+         7       608      0.9%
+         8       215      0.3%
+     total     65203  100.0%
+Using train_batch_size=128, test_batch_size=1
+Device: cuda
+[GPU before model init] allocated=0.0MB  reserved=0.0MB  peak=0.0MB  total=45457.6MB
+[GPU after model init] allocated=32.1MB  reserved=34.0MB  peak=32.1MB  total=45457.6MB
+now training qmc model
+  0%|          | 0/100 [00:00<?, ?it/s]  1%|          | 1/100 [00:11<19:24, 11.76s/it]  [GPU epoch 1] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+  2%|▏         | 2/100 [00:23<19:17, 11.81s/it]  [GPU epoch 2] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+  3%|▎         | 3/100 [00:35<19:02, 11.78s/it]  [GPU epoch 3] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+  4%|▍         | 4/100 [00:47<18:51, 11.79s/it]  [GPU epoch 4] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+  5%|▌         | 5/100 [00:58<18:32, 11.71s/it]  [GPU epoch 5] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+  6%|▌         | 6/100 [01:10<18:26, 11.77s/it]  [GPU epoch 6] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+  7%|▋         | 7/100 [01:22<18:19, 11.83s/it]  [GPU epoch 7] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+  8%|▊         | 8/100 [01:34<18:10, 11.86s/it]  [GPU epoch 8] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+  9%|▉         | 9/100 [01:46<18:00, 11.88s/it]  [GPU epoch 9] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 10%|█         | 10/100 [01:58<17:45, 11.84s/it]  [GPU epoch 10] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 11%|█         | 11/100 [02:10<17:34, 11.85s/it]  [GPU epoch 11] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 12%|█▏        | 12/100 [02:21<17:21, 11.84s/it]  [GPU epoch 12] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 13%|█▎        | 13/100 [02:33<17:07, 11.81s/it]  [GPU epoch 13] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 14%|█▍        | 14/100 [02:45<17:00, 11.87s/it]  [GPU epoch 14] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 15%|█▌        | 15/100 [02:57<16:44, 11.82s/it]  [GPU epoch 15] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 16%|█▌        | 16/100 [03:09<16:32, 11.81s/it]  [GPU epoch 16] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 17%|█▋        | 17/100 [03:20<16:22, 11.84s/it]  [GPU epoch 17] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 18%|█▊        | 18/100 [03:32<16:10, 11.83s/it]  [GPU epoch 18] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 19%|█▉        | 19/100 [03:44<15:58, 11.83s/it]  [GPU epoch 19] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 20%|██        | 20/100 [03:56<15:48, 11.85s/it]  [GPU epoch 20] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 21%|██        | 21/100 [04:08<15:36, 11.85s/it]  [GPU epoch 21] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 22%|██▏       | 22/100 [04:20<15:21, 11.82s/it]  [GPU epoch 22] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 23%|██▎       | 23/100 [04:31<15:07, 11.78s/it]  [GPU epoch 23] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 24%|██▍       | 24/100 [04:43<14:56, 11.79s/it]  [GPU epoch 24] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 25%|██▌       | 25/100 [04:55<14:46, 11.82s/it]  [GPU epoch 25] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 26%|██▌       | 26/100 [05:07<14:36, 11.84s/it]  [GPU epoch 26] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 27%|██▋       | 27/100 [05:19<14:29, 11.92s/it]  [GPU epoch 27] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 28%|██▊       | 28/100 [05:31<14:13, 11.85s/it]  [GPU epoch 28] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 29%|██▉       | 29/100 [05:43<14:07, 11.94s/it]  [GPU epoch 29] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 30%|███       | 30/100 [05:55<13:59, 11.99s/it]  [GPU epoch 30] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 31%|███       | 31/100 [06:07<13:50, 12.04s/it]  [GPU epoch 31] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 32%|███▏      | 32/100 [06:19<13:37, 12.02s/it]  [GPU epoch 32] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 33%|███▎      | 33/100 [06:31<13:26, 12.04s/it]  [GPU epoch 33] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 34%|███▍      | 34/100 [06:43<13:17, 12.08s/it]  [GPU epoch 34] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 35%|███▌      | 35/100 [06:56<13:09, 12.14s/it]  [GPU epoch 35] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 36%|███▌      | 36/100 [07:08<12:57, 12.15s/it]  [GPU epoch 36] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 37%|███▋      | 37/100 [07:20<12:44, 12.14s/it]  [GPU epoch 37] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 38%|███▊      | 38/100 [07:32<12:32, 12.13s/it]  [GPU epoch 38] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 39%|███▉      | 39/100 [07:44<12:18, 12.11s/it]  [GPU epoch 39] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 40%|████      | 40/100 [07:56<12:07, 12.13s/it]  [GPU epoch 40] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 41%|████      | 41/100 [08:08<11:53, 12.10s/it]  [GPU epoch 41] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 42%|████▏     | 42/100 [08:20<11:40, 12.08s/it]  [GPU epoch 42] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 43%|████▎     | 43/100 [08:32<11:27, 12.06s/it]  [GPU epoch 43] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 44%|████▍     | 44/100 [08:44<11:13, 12.02s/it]  [GPU epoch 44] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 45%|████▌     | 45/100 [08:56<10:59, 12.00s/it]  [GPU epoch 45] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 46%|████▌     | 46/100 [09:08<10:49, 12.04s/it]  [GPU epoch 46] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 47%|████▋     | 47/100 [09:21<10:41, 12.11s/it]  [GPU epoch 47] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 48%|████▊     | 48/100 [09:33<10:31, 12.15s/it]  [GPU epoch 48] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 49%|████▉     | 49/100 [09:45<10:21, 12.18s/it]  [GPU epoch 49] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 50%|█████     | 50/100 [09:57<10:09, 12.19s/it]  [GPU epoch 50] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 51%|█████     | 51/100 [10:10<09:57, 12.19s/it]  [GPU epoch 51] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 52%|█████▏    | 52/100 [10:22<09:43, 12.17s/it]  [GPU epoch 52] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 53%|█████▎    | 53/100 [10:34<09:31, 12.15s/it]  [GPU epoch 53] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 54%|█████▍    | 54/100 [10:46<09:22, 12.22s/it]  [GPU epoch 54] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 55%|█████▌    | 55/100 [10:58<09:07, 12.16s/it]  [GPU epoch 55] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 56%|█████▌    | 56/100 [11:10<08:52, 12.10s/it]  [GPU epoch 56] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 57%|█████▋    | 57/100 [11:22<08:39, 12.08s/it]  [GPU epoch 57] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 58%|█████▊    | 58/100 [11:34<08:29, 12.14s/it]  [GPU epoch 58] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 59%|█████▉    | 59/100 [11:46<08:16, 12.12s/it]  [GPU epoch 59] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 60%|██████    | 60/100 [11:59<08:06, 12.16s/it]  [GPU epoch 60] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 61%|██████    | 61/100 [12:11<07:55, 12.18s/it]  [GPU epoch 61] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 62%|██████▏   | 62/100 [12:23<07:44, 12.23s/it]  [GPU epoch 62] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 63%|██████▎   | 63/100 [12:36<07:31, 12.22s/it]  [GPU epoch 63] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 64%|██████▍   | 64/100 [12:48<07:20, 12.24s/it]  [GPU epoch 64] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 65%|██████▌   | 65/100 [13:00<07:07, 12.21s/it]  [GPU epoch 65] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 66%|██████▌   | 66/100 [13:12<06:53, 12.17s/it]  [GPU epoch 66] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 67%|██████▋   | 67/100 [13:24<06:40, 12.14s/it]  [GPU epoch 67] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 68%|██████▊   | 68/100 [13:36<06:27, 12.10s/it]  [GPU epoch 68] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 69%|██████▉   | 69/100 [13:48<06:15, 12.13s/it]  [GPU epoch 69] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 70%|███████   | 70/100 [14:01<06:06, 12.21s/it]  [GPU epoch 70] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 71%|███████   | 71/100 [14:13<05:53, 12.19s/it]  [GPU epoch 71] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 72%|███████▏  | 72/100 [14:25<05:42, 12.25s/it]  [GPU epoch 72] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 73%|███████▎  | 73/100 [14:37<05:30, 12.22s/it]  [GPU epoch 73] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 74%|███████▍  | 74/100 [14:49<05:16, 12.19s/it]  [GPU epoch 74] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 75%|███████▌  | 75/100 [15:02<05:05, 12.20s/it]  [GPU epoch 75] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 76%|███████▌  | 76/100 [15:14<04:54, 12.29s/it]  [GPU epoch 76] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 77%|███████▋  | 77/100 [15:27<04:43, 12.32s/it]  [GPU epoch 77] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 78%|███████▊  | 78/100 [15:39<04:32, 12.39s/it]  [GPU epoch 78] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 79%|███████▉  | 79/100 [15:51<04:18, 12.33s/it]  [GPU epoch 79] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 80%|████████  | 80/100 [16:03<04:04, 12.21s/it]  [GPU epoch 80] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 81%|████████  | 81/100 [16:15<03:50, 12.15s/it]  [GPU epoch 81] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 82%|████████▏ | 82/100 [16:27<03:38, 12.14s/it]  [GPU epoch 82] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 83%|████████▎ | 83/100 [16:40<03:26, 12.15s/it]  [GPU epoch 83] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 84%|████████▍ | 84/100 [16:52<03:15, 12.25s/it]  [GPU epoch 84] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 85%|████████▌ | 85/100 [17:04<03:04, 12.27s/it]  [GPU epoch 85] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 86%|████████▌ | 86/100 [17:17<02:51, 12.28s/it]  [GPU epoch 86] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 87%|████████▋ | 87/100 [17:29<02:39, 12.24s/it]  [GPU epoch 87] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 88%|████████▊ | 88/100 [17:41<02:25, 12.10s/it]  [GPU epoch 88] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 89%|████████▉ | 89/100 [17:53<02:13, 12.11s/it]  [GPU epoch 89] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 90%|█████████ | 90/100 [18:05<02:01, 12.12s/it]  [GPU epoch 90] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 91%|█████████ | 91/100 [18:17<01:49, 12.11s/it]  [GPU epoch 91] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 92%|█████████▏| 92/100 [18:29<01:37, 12.14s/it]  [GPU epoch 92] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 93%|█████████▎| 93/100 [18:41<01:25, 12.14s/it]  [GPU epoch 93] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 94%|█████████▍| 94/100 [18:54<01:13, 12.22s/it]  [GPU epoch 94] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 95%|█████████▌| 95/100 [19:06<01:01, 12.21s/it]  [GPU epoch 95] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 96%|█████████▌| 96/100 [19:18<00:48, 12.18s/it]  [GPU epoch 96] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 97%|█████████▋| 97/100 [19:30<00:36, 12.18s/it]  [GPU epoch 97] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 98%|█████████▊| 98/100 [19:42<00:24, 12.16s/it]  [GPU epoch 98] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+ 99%|█████████▉| 99/100 [19:55<00:12, 12.20s/it]  [GPU epoch 99] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+100%|██████████| 100/100 [20:07<00:00, 12.17s/it]100%|██████████| 100/100 [20:07<00:00, 12.07s/it]
+  [GPU epoch 100] allocated=144.9MB  reserved=712.0MB  peak=459.4MB
+[GPU after training] allocated=144.8MB  reserved=712.0MB  peak=459.4MB  total=45457.6MB

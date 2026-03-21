@@ -286,7 +286,7 @@ class mouse_data(Dataset):
         binary_mask = (mask > 0.5).float().unsqueeze(0)   # 1 x H x W
         spec = spec * binary_mask
 
-        return (spec, mask, ml, spec_id)   
+        return (spec, ml.float(), mask, spec_id)
                                                                                                                     
 def print_masks_len_stats(masks_len, label=''):
     """Print distribution of masks_len values."""                                                                      

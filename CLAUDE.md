@@ -64,9 +64,15 @@ Generates QMC sequences:
 
 ### Data (`data/`)
 
-- `bird_data.py` — HDF5-based bird vocalization spectrograms with conditional factors
+- `bird_data.py` — HDF5-based bird vocalization spectrograms with conditional factors; `hdf5_data_general` handles HDF5s of unknown per-file length
+- `mouse_data.py` — mouse vocalization spectrograms from `.pt` files; `mouse_data` dataset supports equal sampling across syllable-length bins
 - `dynamics_data.py` — motion capture data (AMC format)
 - `toy_dsets.py` — synthetic datasets
+
+### Model Saving/Loading (`train/model_saving_loading.py`)
+
+- `save(model, optimizer, run_info, fn)` / `load(model, optimizer, fn)` — standard checkpoint pattern
+- `convert_qmc_dict` handles weight dict migration when basis was moved out of the decoder into the model object
 
 ### Analysis (`analysis/`)
 
@@ -81,3 +87,7 @@ Post-training analysis tools:
 - Lattice size (`n_lattice`) and latent dimension (`latent_dim`) are the primary hyperparameters
 - Conditional models take extra factor inputs; see `qmc_conditional_gerbil.py` for examples
 - HDF5 datasets stream from disk — do not assume data fits in memory
+- The key stochasticity during training: a random shift `r ~ Uniform[0,1]^d` is added to the entire lattice at each forward pass (`(r + lattice) % 1`), not individual point sampling
+- `get_decoder_arch(dataset_name, latent_dim, arch='qmc')` in `models/utils.py` selects architecture by `dataset_name` substring match; `arch='qmc'` doubles `latent_dim` internally to account for `TorusBasis` expanding coordinates to `(cos, sin)` pairs
+- `mnist_example/qlvm.py` uses `QLVM`; the production model in `models/qmc_base.py` is `QMCLVM` — same design, QMCLVM adds `shift_function` customization and conditional `c` input
+- `sampling.py` also contains Voronoi-based posterior refinement (`get_default_voronoi`, `sample_from_cells`) for fine-grained resampling after initial training
