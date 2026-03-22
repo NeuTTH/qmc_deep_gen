@@ -302,6 +302,11 @@ class mouse_data(Dataset):
         mask    = self.masks[index]                        # H x W
         ml      = self.masks_len[index]
         spec_id = self.spec_ids[index]
+        
+        # Per-spectrogram MinMax normalization to [0, 1] before masking
+        spec_min = spec.min()
+        spec_max = spec.max()
+        spec = (spec - spec_min) / (spec_max - spec_min + 1e-8)
 
         binary_mask = (mask > 0.5).float().unsqueeze(0)   # 1 x H x W
         spec = spec * binary_mask
