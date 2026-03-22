@@ -269,6 +269,26 @@ class mouse_data(Dataset):
 
             print_masks_len_stats(masks_len, label=f'After equal sampling (max_samples={max_samples}, per_bin={per_bin})')
 
+        elif not equal_sampling and max_samples is not None:
+            # Random sampling without equal distribution across bins
+            rng = np.random.default_rng(seed)
+            n_available = len(spectrograms)
+
+            if n_available > max_samples:
+                # Randomly select max_samples indices without replacement
+                selected = rng.choice(n_available, size=max_samples, replace=False)
+                selected = np.sort(selected)
+            else:
+                # If we have fewer samples than requested, keep all
+                selected = np.arange(n_available)
+
+            spectrograms = spectrograms[selected]
+            masks        = masks[selected]
+            masks_len    = masks_len[selected]
+            spec_ids     = [spec_ids[i] for i in selected]
+
+            print_masks_len_stats(masks_len, label=f'After random sampling (max_samples={max_samples})')
+
         self.spectrograms = spectrograms
         self.masks        = masks
         self.masks_len    = masks_len

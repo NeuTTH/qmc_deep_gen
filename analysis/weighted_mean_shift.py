@@ -192,8 +192,8 @@ def _predict_single_seed(my_mean,X,nbrs,max_iter,centers,weights=None,tol=1e-2,v
         #    points_within = []
         #    break # if sum of weights i proportionally less than volume in space
         my_old_mean = my_mean  # save the old mean
-        
-        my_mean = np.sum(weights_within * points_within,axis=0) #np.mean(points_within*weights_within, axis=0)
+
+        my_mean = np.sum(weights_within[:, None] * points_within, axis=0) #np.mean(points_within*weights_within, axis=0)
         #print(my_mean)
         # If converged or at max_iter, adds the cluster
         if (
@@ -247,8 +247,8 @@ def _mean_shift_single_seed(my_mean, X, nbrs, max_iter,weights=None,seed_no=0,ve
             points_within = []
             break # if sum of weights i proportionally less than volume in space
         my_old_mean = my_mean  # save the old mean
-        
-        my_mean = np.sum(weights_within * points_within,axis=0) #np.mean(points_within*weights_within, axis=0)
+
+        my_mean = np.sum(weights_within[:, None] * points_within, axis=0) #np.mean(points_within*weights_within, axis=0)
         #print(my_mean)
         # If converged or at max_iter, adds the cluster
         if (
