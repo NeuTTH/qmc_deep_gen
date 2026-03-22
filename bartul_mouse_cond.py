@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 import os
 from torch.optim import Adam
 from train.model_saving_loading import *
-from plotting.visualize import *
+from plotting.visualize import format_plot_axis, conditional_qmc_grid_plot
 from data.mouse_data import load_mouse_data, mouse_data
 
 import fire
@@ -95,9 +95,9 @@ def run_mouse_cond_experiments(save_location, dataloc, train_grid_m=15, test_gri
     # grid plots — one per masks_len value
     for ml_val in range(1, 9):
         c = torch.tensor([[float(ml_val)]], device=device)
-        model_grid_plot(qmc_model.to(device), n_samples_dim=20, show=False,
-                        fn=os.path.join(save_location, f'qmc_cond_grid_ml{ml_val}.png'),
-                        origin='lower', cm='viridis', c=c)
+        conditional_qmc_grid_plot(qmc_model.to(device), n_samples_dim=20, c=c, show=False,
+                                  fn=os.path.join(save_location, f'qmc_cond_grid_ml{ml_val}.png'),
+                                  origin='lower', cm='viridis')
 
     lp_fnc = lambda x, y: binary_lp(x, y)
     sample_inds = np.random.choice(len(test_loader.dataset), n_recons, replace=False)
