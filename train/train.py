@@ -62,7 +62,7 @@ def test_epoch(model,loader,base_sequence,loss_function,conditional=False,random
     test_loss = 0
     epoch_losses = []
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(loader)):
+        for batch_idx, batch in enumerate(loader):
             data = batch[0]
             data = data.to(model.device)
             if conditional:

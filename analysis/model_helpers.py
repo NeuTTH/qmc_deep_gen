@@ -2,6 +2,42 @@ import torch
 from tqdm import tqdm
 import numpy as np
 
+def get_posterior_summaries(model, lattice, loader, lp):
+    """
+    Single-pass streaming alternative to get_stacked_posterior.
+    Never materializes the full (n_samples, n_lattice) matrix.
+
+    Returns:
+        torus_weighted : (n_samples, 2*latent_dim)  — posterior-weighted torus embedding per sample
+        aggregated     : (n_lattice,)               — sum of posteriors across all samples (for heatmap)
+        max_posteriors : (n_samples,)               — max posterior per sample (for clustering weights)
+    """
+    lattice_np = lattice.cpu().numpy()
+    lattice_torus = torus_forward(lattice_np)   # precomputed once: (n_lattice, 2*latent_dim)
+
+    lattice = lattice.to(model.device)
+    model.eval()
+
+    torus_weighted_list = []
+    max_posteriors_list = []
+    aggregated = np.zeros(len(lattice_np), dtype=np.float64)
+
+    for batch in tqdm(loader, total=len(loader)):
+        data = batch[0].to(model.device)
+        with torch.no_grad():
+            posterior = model.posterior_probability(lattice, data, lp)  # (batch, n_lattice)
+        p = posterior.cpu().numpy()
+
+        torus_weighted_list.append(p @ lattice_torus)   # (batch, 2*latent_dim)
+        aggregated += p.sum(axis=0)                      # accumulate into (n_lattice,)
+        max_posteriors_list.append(p.max(axis=1))        # (batch,)
+
+    torus_weighted = np.vstack(torus_weighted_list)
+    max_posteriors = np.concatenate(max_posteriors_list)
+
+    return torus_weighted, aggregated, max_posteriors
+
+
 def get_stacked_posterior(model,lattice,loader,lp):
 
     posteriors = []

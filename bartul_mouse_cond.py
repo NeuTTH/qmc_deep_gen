@@ -13,14 +13,17 @@ from data.mouse_data import load_mouse_data, mouse_data
 
 import matplotlib.pyplot as plt
 
+import json
+import random
+import numpy as np
 import fire
 
 def collate_mouse_cond(batch):
     """Stack specs normally; reduce per-sample ml to a single batch mean scalar."""
     specs    = torch.stack([b[0] for b in batch])
     ml_mean  = torch.tensor([b[1].float().mean() for b in batch]).mean().unsqueeze(0)  # (1,)
-    masks    = torch.stack([b[2] for b in batch])
-    spec_ids = [b[3] for b in batch]
+    masks    = torch.stack([b[3] for b in batch])
+    spec_ids = [b[4] for b in batch]
     return (specs, ml_mean, masks, spec_ids)
 
 def print_gpu_memory(label=""):
@@ -33,14 +36,21 @@ def print_gpu_memory(label=""):
     else:
         print(f"[GPU {label}] no CUDA device available")
 
-def run_mouse_cond_experiments(save_location, dataloc, train_grid_m=15, test_grid_m=20, n_recons=50, nEpochs=300, max_train_samples=None, train_batch_size=64, test_batch_size=1, print_gpu_mem=False):
+def run_mouse_cond_experiments(save_location, dataloc, train_grid_m=15, test_grid_m=20, n_recons=50, nEpochs=300, total_samples=None, train_batch_size=64, test_batch_size=1, print_gpu_mem=False, seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
     if not os.path.exists(save_location):
         print(f"Creating save directory: {save_location}")
         os.makedirs(save_location)
     train_dict, val_dict = load_mouse_data(dataloc)
-    train_ds = mouse_data(train_dict, max_samples=max_train_samples, masks_len_range=(1, 8), equal_sampling=True)
-    test_ds = mouse_data(val_dict, masks_len_range=(1, 8), equal_sampling=False)
+    train_ds = mouse_data(train_dict, filter_mask=True, lo=1, hi=8,
+                          sampling_strategy='subsample', total_samples=total_samples, seed=seed)
+    test_ds = mouse_data(val_dict, filter_mask=True, lo=1, hi=8, seed=seed)
+    json.dump(train_ds.sampling_config,
+              open(os.path.join(save_location, 'sampling_config.json'), 'w'), indent=2)
     n_workers = len(os.sched_getaffinity(0))
     print(f"Using train_batch_size={train_batch_size}, test_batch_size={test_batch_size}")
     train_loader = DataLoader(train_ds, num_workers=n_workers, shuffle=True, batch_size=train_batch_size, collate_fn=collate_mouse_cond)

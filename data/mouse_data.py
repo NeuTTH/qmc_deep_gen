@@ -202,107 +202,165 @@ def load_mouse_data(data_dir):
 
     Returns (train_dict, val_dict).
     """
-    train_dict = torch.load(os.path.join(data_dir, 'train_data.pt'))
-    val_dict   = torch.load(os.path.join(data_dir, 'val_data.pt'))
+    train_dict = torch.load(os.path.join(data_dir, 'train_data.pt'), mmap=True)
+    val_dict   = torch.load(os.path.join(data_dir, 'val_data.pt'), mmap=True)
     return train_dict, val_dict
 
 
+def _quantile_sample(bin_inds, durations, n):
+    """Return n indices from bin_inds evenly spaced across the duration distribution.
+
+    Sorts bin_inds by duration, then picks n quantile-evenly-spaced positions.
+    """
+    order = np.argsort(durations[bin_inds])
+    sorted_inds = bin_inds[order]
+    positions = np.round(np.linspace(0, len(sorted_inds) - 1, n)).astype(int)
+    return sorted_inds[positions]
+
+
 class mouse_data(Dataset):
-    """Dataset for pre-processed mouse vocalization spectrograms.                                                      
-                                                                                                                        
+    """Dataset for pre-processed mouse vocalization spectrograms.
+
     Expects a dict as saved by preprocess_and_save_data.py:
-        'spectrograms': float tensor  (N x H x W)                                                                      
+        'spectrograms': float tensor  (N x H x W)
         'masks':        float tensor  (N x H x W)
-        'masks_len':    long tensor   (N,)                                                                             
+        'masks_len':    long tensor   (N,)
         'durations':    long tensor   (N,)
-        'spec_id':      list of str   (N,)                                                                             
-                
-    Subsamples equally across masks_len bins up to max_samples total.                                                  
-    __getitem__ returns (spec, mask, masks_len, spec_id) where spec is (1 x H x W).
-    """                                                                                                                
-                
-    def __init__(self, data_dict, max_samples=None, masks_len_range=(1, 8), equal_sampling=True, seed=42):
+        'spec_id':      list of str   (N,)
+
+    Sampling is two-stage:
+
+    Stage 1 — Mask filtering (filter_mask=True):
+        Keep only samples where masks_len ∈ [lo, hi].
+
+    Stage 2 — Sampling strategy (applied to filtered set):
+        None             : return full dataset
+        "mask_duration"  : per masks_len bin, keep ≤ samples_per_mask entries,
+                           quantile-sampled by duration (always duration-aware).
+                           No oversampling.
+        "subsample"      : draw total_samples total, proportional to each bin's
+                           natural share; cap at bin size (no oversampling).
+                           duration_aware=True uses quantile sampling within each
+                           bin; False draws randomly.
+
+    self.sampling_config records the full configuration and result counts for
+    reproducibility. self.seed stores the random seed used.
+
+    __getitem__ returns (spec, masks_len, duration, mask, spec_id) where spec is (1 x H x W).
+    """
+
+    def __init__(self, data_dict,
+                 # Stage 1: filtering
+                 filter_mask=False,
+                 lo=1, hi=8,
+                 # Stage 2: sampling
+                 sampling_strategy=None,   # None | "mask_duration" | "subsample"
+                 samples_per_mask=None,    # used by "mask_duration"
+                 total_samples=None,       # used by "subsample"
+                 duration_aware=False,     # used by "subsample"
+                 seed=42):
         spectrograms = data_dict['spectrograms']
         masks        = data_dict['masks']
         masks_len    = data_dict['masks_len']
+        durations    = data_dict.get('durations', torch.zeros(len(spectrograms), dtype=torch.long))
         spec_ids     = data_dict.get('spec_id', [None] * len(spectrograms))
 
         print_masks_len_stats(masks_len, label='Full dataset')
 
-        # Filter to valid masks_len range
-        lo, hi = masks_len_range
-        valid = (masks_len >= lo) & (masks_len <= hi)
-        spectrograms = spectrograms[valid]
-        masks        = masks[valid]
-        masks_len    = masks_len[valid]
-        spec_ids     = [s for s, v in zip(spec_ids, valid.tolist()) if v]
+        # Stage 1: Mask length filtering
+        if filter_mask:
+            valid = (masks_len >= lo) & (masks_len <= hi)
+            spectrograms = spectrograms[valid]
+            masks        = masks[valid]
+            masks_len    = masks_len[valid]
+            durations    = durations[valid]
+            spec_ids     = [s for s, v in zip(spec_ids, valid.tolist()) if v]
+            print_masks_len_stats(masks_len, label=f'After filtering masks_len to [{lo}, {hi}]')
 
-        print_masks_len_stats(masks_len, label=f'After filtering masks_len to [{lo}, {hi}]')
+        n_after_filter = len(spectrograms)
 
-        if equal_sampling and max_samples is not None:
-            unique_lens = torch.unique(masks_len)
-            n_bins = len(unique_lens)
-            per_bin = max_samples // n_bins
+        # Stage 2: Sampling strategy
+        rng = np.random.default_rng(seed)
 
-            rng = np.random.default_rng(seed)
+        if sampling_strategy == 'mask_duration':
+            unique_lens  = torch.unique(masks_len)
+            durations_np = durations.numpy()
+            masks_len_np = masks_len.numpy()
             selected = []
             for ml in unique_lens:
-                bin_inds = torch.where(masks_len == ml)[0].numpy()
-                bin_size = len(bin_inds)
-
-                if bin_size >= per_bin:
-                    # undersample without replacement
-                    chosen = rng.choice(bin_inds, size=per_bin, replace=False)
+                bin_inds = np.where(masks_len_np == ml.item())[0]
+                if len(bin_inds) <= samples_per_mask:
+                    selected.append(bin_inds)
                 else:
-                    # take all, then oversample remainder with replacement
-                    remainder = per_bin - bin_size
-                    extra = rng.choice(bin_inds, size=remainder, replace=True)
-                    chosen = np.concatenate([bin_inds, extra])
-
-                selected.append(chosen)
-
+                    selected.append(_quantile_sample(bin_inds, durations_np, samples_per_mask))
             selected = np.sort(np.concatenate(selected))
             spectrograms = spectrograms[selected]
             masks        = masks[selected]
             masks_len    = masks_len[selected]
+            durations    = durations[selected]
             spec_ids     = [spec_ids[i] for i in selected]
+            print_masks_len_stats(masks_len, label=f'After mask_duration sampling (samples_per_mask={samples_per_mask})')
 
-            print_masks_len_stats(masks_len, label=f'After equal sampling (max_samples={max_samples}, per_bin={per_bin})')
-
-        elif not equal_sampling and max_samples is not None:
-            # Random sampling without equal distribution across bins
-            rng = np.random.default_rng(seed)
+        elif sampling_strategy == 'subsample':
             n_available = len(spectrograms)
+            if total_samples is not None and total_samples < n_available:
+                unique_lens  = torch.unique(masks_len)
+                durations_np = durations.numpy()
+                masks_len_np = masks_len.numpy()
+                selected = []
+                for ml in unique_lens:
+                    bin_inds = np.where(masks_len_np == ml.item())[0]
+                    bin_size = len(bin_inds)
+                    n_bin = min(int(np.floor(total_samples * bin_size / n_available)), bin_size)
+                    if n_bin == 0:
+                        continue
+                    if duration_aware:
+                        selected.append(_quantile_sample(bin_inds, durations_np, n_bin))
+                    else:
+                        selected.append(rng.choice(bin_inds, size=n_bin, replace=False))
+                selected = np.sort(np.concatenate(selected))
+                spectrograms = spectrograms[selected]
+                masks        = masks[selected]
+                masks_len    = masks_len[selected]
+                durations    = durations[selected]
+                spec_ids     = [spec_ids[i] for i in selected]
+                print_masks_len_stats(masks_len, label=f'After subsample (total_samples={total_samples}, duration_aware={duration_aware})')
 
-            if n_available > max_samples:
-                # Randomly select max_samples indices without replacement
-                selected = rng.choice(n_available, size=max_samples, replace=False)
-                selected = np.sort(selected)
-            else:
-                # If we have fewer samples than requested, keep all
-                selected = np.arange(n_available)
-
-            spectrograms = spectrograms[selected]
-            masks        = masks[selected]
-            masks_len    = masks_len[selected]
-            spec_ids     = [spec_ids[i] for i in selected]
-
-            print_masks_len_stats(masks_len, label=f'After random sampling (max_samples={max_samples})')
+        elif sampling_strategy is not None:
+            raise ValueError(
+                f"Unknown sampling_strategy: {sampling_strategy!r}. "
+                "Expected None, 'mask_duration', or 'subsample'."
+            )
 
         self.spectrograms = spectrograms
         self.masks        = masks
         self.masks_len    = masks_len
+        self.durations    = durations
         self.spec_ids     = spec_ids
+        self.seed         = seed
+        self.sampling_config = {
+            'filter_mask':       filter_mask,
+            'lo':                lo if filter_mask else None,
+            'hi':                hi if filter_mask else None,
+            'sampling_strategy': sampling_strategy,
+            'samples_per_mask':  samples_per_mask,
+            'total_samples':     total_samples,
+            'duration_aware':    duration_aware,
+            'seed':              seed,
+            'n_after_filter':    n_after_filter,
+            'n_final':           len(self.spectrograms),
+        }
 
     def __len__(self):
         return len(self.spectrograms)
 
     def __getitem__(self, index):
-        spec    = self.spectrograms[index].unsqueeze(0)   # 1 x H x W
-        mask    = self.masks[index]                        # H x W
-        ml      = self.masks_len[index]
-        spec_id = self.spec_ids[index]
-        
+        spec     = self.spectrograms[index].unsqueeze(0)   # 1 x H x W
+        mask     = self.masks[index]                        # H x W
+        ml       = self.masks_len[index]
+        duration = self.durations[index]
+        spec_id  = self.spec_ids[index]
+
         # Per-spectrogram MinMax normalization to [0, 1] before masking
         spec_min = spec.min()
         spec_max = spec.max()
@@ -311,7 +369,7 @@ class mouse_data(Dataset):
         binary_mask = (mask > 0.5).float().unsqueeze(0)   # 1 x H x W
         spec = spec * binary_mask
 
-        return (spec, ml.float(), mask, spec_id)
+        return (spec, ml.float(), duration.float(), mask, spec_id)
                                                                                                                     
 def print_masks_len_stats(masks_len, label=''):
     """Print distribution of masks_len values."""                                                                      

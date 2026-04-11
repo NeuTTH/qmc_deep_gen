@@ -17,7 +17,9 @@ Usage:
         --vae_epochs=300
 """
 
+import json
 import os
+import random
 import torch
 import torch.nn as nn
 import numpy as np
@@ -274,12 +276,18 @@ def compare_qmc_vae_mouse(
     vae_epochs=300,
     qmc_latent_dim=2,
     vae_latent_dim=32,       # 8D VAE matches 2D QMC per the paper
-    max_train_samples=100000, # None = use all; set e.g. 10000 for equal-sampled subset
+    total_samples=100000,     # None = use all; set e.g. 10000 for proportional subsample
     train_batch_size=512,
     test_batch_size=1,
     jac_samples=2000,
     use_train_data=False,
+    seed=42,
 ):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -290,8 +298,11 @@ def compare_qmc_vae_mouse(
     data_dict = train_dict if use_train_data else val_dict
     data_name = "TRAIN" if use_train_data else "TEST"
 
-    train_ds = mouse_data(train_dict, max_samples=max_train_samples, masks_len_range=(1, 8), equal_sampling=True)
-    test_ds  = mouse_data(data_dict,  masks_len_range=(1, 8), equal_sampling=False)
+    train_ds = mouse_data(train_dict, filter_mask=True, lo=1, hi=8,
+                          sampling_strategy='subsample', total_samples=total_samples, seed=seed)
+    test_ds  = mouse_data(data_dict,  filter_mask=True, lo=1, hi=8, seed=seed)
+    json.dump(train_ds.sampling_config,
+              open(os.path.join(save_dir, 'sampling_config.json'), 'w'), indent=2)
     print(f"Train: {len(train_ds)}  |  {data_name}: {len(test_ds)}")
     
     # Diagnose spectrogram range — binary loss requires data in [0, 1]
