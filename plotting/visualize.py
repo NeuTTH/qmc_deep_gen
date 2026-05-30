@@ -56,30 +56,28 @@ def model_grid_plot(model,n_samples_dim,fn='',show=True,origin=None,cm='grey',mo
         plt.savefig(fn)
     plt.close()
 
-def conditional_qmc_grid_plot(model,n_samples_dim,c,fn='',show=True,origin=None,cm='grey',):
+def conditional_qmc_grid_plot(model,n_samples_dim,c,fn='',show=True,origin=None,cm='grey',title=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #n_samples_dim = 10
     n_samples=n_samples_dim**2
     cmap=mpl.colormaps['plasma']
     norm = mpl.colors.Normalize(-1,n_samples)
+    cell_size = max(1.0, 20 / n_samples_dim)
+    figsize = (n_samples_dim * cell_size, n_samples_dim * cell_size)
     with torch.no_grad():
-        #z = torch.rand(n_samples, 2).to(device)
         xx,yy = torch.meshgrid([torch.linspace(0,1,n_samples_dim)]*2,indexing='ij')
         z = torch.stack([xx.flatten(),yy.flatten()],axis=-1).to(device)
-       
+
         sample = model(z,c=c.to(device),random=False,mod=False)
-        
+
     if sample.shape[1] == 3:
         sample = sample.permute(0,2,3,1)
     sample = sample.detach().cpu()
-    z = z.detach().cpu().numpy()
     inds = np.arange(n_samples)
-    cs = cmap(norm(inds))
 
-    mosaic = [[f"sample {ii*n_samples_dim + jj}" for ii in range(n_samples_dim)] for jj in range(n_samples_dim)]                
+    mosaic = [[f"sample {ii*n_samples_dim + jj}" for ii in range(n_samples_dim)] for jj in range(n_samples_dim)]
 
-    fig, axes = plt.subplot_mosaic(mosaic,figsize=(20,20),sharex=True,sharey=True,gridspec_kw={'wspace':0.01,'hspace':0.01})
+    fig, axes = plt.subplot_mosaic(mosaic,figsize=figsize,sharex=True,sharey=True,gridspec_kw={'wspace':0.01,'hspace':0.01})
 
     for ii in range(n_samples):
         ax = axes[f"sample {ii}"]
@@ -89,13 +87,14 @@ def conditional_qmc_grid_plot(model,n_samples_dim,c,fn='',show=True,origin=None,
         ax.set_yticks([])
         ax.set_xticks([])
 
-    plt.suptitle(f"grid conditioned on factor {c}")
+    suptitle = title if title is not None else f"grid conditioned on {c.cpu().numpy()}"
+    plt.suptitle(suptitle, fontsize=12, y=1.01)
 
     if show:
         plt.show()
     else:
-        plt.savefig(fn)
-    
+        plt.savefig(fn, dpi=150, bbox_inches='tight')
+
     plt.close()
 
 def vae_train_plot(vae_train_losses,vae_test_losses,save_fn):

@@ -108,16 +108,44 @@ def _save_diagnostic_plots(
     plt.close()
 
 
-def _save_round_trip_panel(dataset, model, base_sequence, lp_fnc, device, save_path, n_per_mask=10, seed=42):
+def precompute_round_trip_indices(dataset, n_per_mask=10, seed=42):
+    """Pre-compute fixed per-masks_len sample indices for round-trip panels.
+
+    Returns a dict mapping each unique masks_len value to a numpy array of
+    dataset indices (length <= n_per_mask).  Pass this to _save_round_trip_panel
+    to keep the same samples across every epoch.
+    """
+    rng = np.random.default_rng(seed)
+    ml_all = dataset.masks_len.numpy()
+    indices = {}
+    for ml in np.unique(ml_all):
+        bin_inds = np.where(ml_all == ml)[0]
+        chosen = rng.choice(bin_inds, size=min(n_per_mask, len(bin_inds)), replace=False)
+        indices[int(ml)] = chosen
+    return indices
+
+
+def _save_round_trip_panel(dataset, model, base_sequence, lp_fnc, device, save_path, n_per_mask=10, seed=42, fixed_indices=None):
     """Save a single round-trip figure grouped by masks_len.
 
     Layout: each unique masks_len value occupies a pair of consecutive rows —
     row 2i = originals, row 2i+1 = reconstructions.  Columns = samples (up to
     n_per_mask per masks_len group).
+
+    fixed_indices: optional dict {masks_len -> array of dataset indices} from
+    precompute_round_trip_indices().  When provided, the same samples are used
+    every call (useful for per-epoch panels).  When None, samples are drawn
+    randomly using seed.
     """
-    rng = np.random.default_rng(seed)
     ml_all = dataset.masks_len.numpy()
     unique_mls = np.unique(ml_all)
+
+    if fixed_indices is None:
+        rng = np.random.default_rng(seed)
+        fixed_indices = {}
+        for ml in unique_mls:
+            bin_inds = np.where(ml_all == ml)[0]
+            fixed_indices[int(ml)] = rng.choice(bin_inds, size=min(n_per_mask, len(bin_inds)), replace=False)
 
     n_rows = 2 * len(unique_mls)
     n_cols = n_per_mask
@@ -131,9 +159,7 @@ def _save_round_trip_panel(dataset, model, base_sequence, lp_fnc, device, save_p
     model.eval()
     with torch.no_grad():
         for row_pair, ml in enumerate(unique_mls):
-            bin_inds = np.where(ml_all == ml)[0]
-            n_avail = len(bin_inds)
-            chosen = rng.choice(bin_inds, size=min(n_per_mask, n_avail), replace=False)
+            chosen = fixed_indices[int(ml)]
 
             orig_row  = 2 * row_pair
             recon_row = 2 * row_pair + 1
@@ -182,6 +208,8 @@ def run_mouse_experiments(
     test_samples_per_mask=50,
     n_dur_bins=5,
     seed=42,
+    model_seed=None,
+    num_workers=None,
     # dataset parameters
     filter_mask=True,
     lo=1,
@@ -190,10 +218,12 @@ def run_mouse_experiments(
     total_samples=None,
     duration_aware=False,
 ):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if model_seed is None:
+        model_seed = seed
+    random.seed(model_seed)
+    np.random.seed(model_seed)
+    torch.manual_seed(model_seed)
+    torch.cuda.manual_seed_all(model_seed)
 
     if not os.path.exists(save_location):
         print(f"Creating save directory: {save_location}")
@@ -211,7 +241,7 @@ def run_mouse_experiments(
     test_ds = mouse_data(val_dict, filter_mask=filter_mask, lo=lo, hi=hi, seed=seed)
     json.dump(train_ds.sampling_config,
               open(os.path.join(save_location, 'sampling_config.json'), 'w'), indent=2)
-    n_workers = len(os.sched_getaffinity(0))
+    n_workers = num_workers if num_workers is not None else len(os.sched_getaffinity(0))
     print(
         f"Using train_batch_size={train_batch_size}, test_batch_size={test_batch_size}"
     )
@@ -292,6 +322,9 @@ def run_mouse_experiments(
     dur_bin_edges[0]  -= 1
     dur_bin_edges[-1] += 1
 
+    # pre-compute fixed indices for per-epoch round-trip panels
+    round_trip_val_indices = precompute_round_trip_indices(test_loader.dataset, n_per_mask=10, seed=seed)
+
     if not os.path.isfile(save_qmc):
         print("now training qmc model")
         torch.cuda.reset_peak_memory_stats()
@@ -329,6 +362,14 @@ def run_mouse_experiments(
                 _save_diagnostic_plots(
                     save_location, qmc_losses, val_loss_epochs, val_losses,
                     diag_epochs, diag_mse, val_diag_ml, val_diag_dur, dur_bin_edges,
+                )
+
+            if (epoch + 1) % 40 == 0:
+                _save_round_trip_panel(
+                    test_loader.dataset, qmc_model,
+                    test_base_sequence.to(device), lp_fnc, device,
+                    os.path.join(save_location, f"qmc_round_trips_val_{epoch + 1}.png"),
+                    n_per_mask=10, fixed_indices=round_trip_val_indices,
                 )
 
             if print_gpu_mem and torch.cuda.is_available():

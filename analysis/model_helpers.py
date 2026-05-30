@@ -2,10 +2,16 @@ import torch
 from tqdm import tqdm
 import numpy as np
 
-def get_posterior_summaries(model, lattice, loader, lp):
+def get_posterior_summaries(model, lattice, loader, lp, c_fn=None):
     """
     Single-pass streaming alternative to get_stacked_posterior.
     Never materializes the full (n_samples, n_lattice) matrix.
+
+    Args:
+        c_fn: optional callable ``c_fn(batch) -> Tensor (1, c_dim)`` that extracts
+              the conditioning tensor for each batch.  When provided, it is passed
+              as ``c=`` to ``model.posterior_probability``.  Pass ``None`` for
+              unconditional models.
 
     Returns:
         torus_weighted : (n_samples, 2*latent_dim)  — posterior-weighted torus embedding per sample
@@ -25,7 +31,11 @@ def get_posterior_summaries(model, lattice, loader, lp):
     for batch in tqdm(loader, total=len(loader)):
         data = batch[0].to(model.device)
         with torch.no_grad():
-            posterior = model.posterior_probability(lattice, data, lp)  # (batch, n_lattice)
+            if c_fn is not None:
+                c = c_fn(batch).to(model.device)
+                posterior = model.posterior_probability(lattice, data, lp, c=c)
+            else:
+                posterior = model.posterior_probability(lattice, data, lp)  # (batch, n_lattice)
         p = posterior.cpu().numpy()
 
         torus_weighted_list.append(p @ lattice_torus)   # (batch, 2*latent_dim)

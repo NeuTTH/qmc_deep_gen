@@ -12,6 +12,7 @@ Usage:
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
@@ -27,7 +28,51 @@ from train.losses import binary_lp
 from torch.optim import Adam
 from data.mouse_data import load_mouse_data, mouse_data
 from analysis.model_helpers import get_posterior_summaries, torus_forward, torus_reverse
-from analysis.clustering import run_mean_shift
+from analysis.clustering import run_mean_shift, run_mean_shift_fast
+
+
+# ---------------------------------------------------------------------------
+# Conditional variable registry  (mirrors bartul_mouse_cond.py)
+#
+# mouse_data.__getitem__ returns:
+#   0: spec            (1 x H x W)
+#   1: masks_len       scalar float
+#   2: raw duration    scalar float
+#   3: norm_duration   scalar float  [0, 1]
+#   4: mean_freq       scalar float  [0, 1]
+#   5: mask_count_onehot  (8,) float
+#   6: mask            (H x W)
+#   7: spec_id         str
+# ---------------------------------------------------------------------------
+CONDITIONAL_REGISTRY = {
+    "mask_count": {"field_idx": 5, "c_dim": 8,  "label": "masks_len (one-hot)"},
+    "duration":   {"field_idx": 3, "c_dim": 1,  "label": "normalized duration"},
+    "mean_freq":  {"field_idx": 4, "c_dim": 1,  "label": "mean frequency"},
+}
+
+
+def _make_c_fn(cond_name, device):
+    """Return a callable ``c_fn(batch) -> Tensor (1, c_dim)`` for use with
+    ``get_posterior_summaries``.  ``batch`` comes from the default DataLoader
+    collate so each element is already a batched tensor."""
+    fi = CONDITIONAL_REGISTRY[cond_name]["field_idx"]
+
+    def c_fn(batch):
+        vals = batch[fi].float()          # (B,) or (B, c_dim)
+        if vals.dim() == 1:
+            vals = vals.unsqueeze(1)      # (B, 1)
+        return vals.mean(dim=0, keepdim=True).to(device)  # (1, c_dim)
+
+    return c_fn
+
+
+def _get_sample_c(dataset, index, cond_name, device):
+    """Extract the conditioning tensor for a single dataset sample → (1, c_dim)."""
+    fi = CONDITIONAL_REGISTRY[cond_name]["field_idx"]
+    val = dataset[index][fi].float()
+    if val.dim() == 0:
+        val = val.unsqueeze(0)    # scalar → (1,)
+    return val.unsqueeze(0).to(device)   # (1, c_dim)
 
 
 def plot_latent_scatter(
@@ -498,14 +543,26 @@ def make_segment_video(
     plt.close()
 
 
-def grid_examples(model, grid_size, save_path, device):
-    """Decode a grid_size x grid_size grid of latent points in [0,1]^2 and plot reconstructions."""
+def grid_examples(model, grid_size, save_path, device, c=None):
+    """Decode a grid_size x grid_size grid of latent points in [0,1]^2 and plot reconstructions.
+
+    Args:
+        c: optional conditioning tensor of shape (1, c_dim).  When provided it is
+           tiled to match the grid batch and concatenated to the basis output before
+           the decoder — matching the conditional model's forward pass.
+    """
     xs = np.linspace(0, 1, grid_size, endpoint=False) + 0.5 / grid_size
     gx, gy = np.meshgrid(xs, xs)
     z = np.stack([gx.ravel(), gy.ravel()], axis=1)
     z_t = torch.tensor(z, dtype=torch.float32, device=device)
     with torch.no_grad():
-        recon = model.decoder(model.basis(z_t)).cpu().numpy().squeeze(1)
+        basis_out = model.basis(z_t)                     # (grid^2, 2*latent_dim)
+        if c is not None:
+            c_exp = c.to(device).expand(len(z_t), -1)   # (grid^2, c_dim)
+            decoder_input = torch.cat([basis_out, c_exp], dim=-1)
+        else:
+            decoder_input = basis_out
+        recon = model.decoder(decoder_input).cpu().numpy().squeeze(1)
 
     fig, axes = plt.subplots(grid_size, grid_size, figsize=(grid_size, grid_size))
     for i in range(grid_size):
@@ -522,7 +579,11 @@ def grid_examples(model, grid_size, save_path, device):
 
 def figure_H_watershed_variants(heatmap, centers, latent_coords, mean_freqs,
                                  scatter_size, scatter_alpha, save_path):
-    """Retired: 5x5 grid of watershed variants over (sigma, compactness)."""
+    """5x5 grid of watershed variants over (sigma, compactness).
+
+    Background: the smoothed heatmap used by watershed in each cell, so
+    boundaries can be judged against the density the algorithm actually sees.
+    """
     from scipy.ndimage import gaussian_filter
     from skimage.segmentation import watershed
 
@@ -532,7 +593,6 @@ def figure_H_watershed_variants(heatmap, centers, latent_coords, mean_freqs,
     res = heatmap.shape[0]
     xx = np.linspace(0, 1, res)
     yy = np.linspace(0, 1, res)
-    sort_idx_freq = np.argsort(mean_freqs)
 
     marker_img_base = np.zeros((res, res), dtype=int)
     for i, (cx, cy) in enumerate(centers):
@@ -544,18 +604,21 @@ def figure_H_watershed_variants(heatmap, centers, latent_coords, mean_freqs,
                              figsize=(len(compacts) * 4, len(sigmas) * 4))
     for row, sigma in enumerate(sigmas):
         smoothed = gaussian_filter(heatmap, sigma=sigma)
+        nz = smoothed[smoothed > 0]
+        vmax = float(np.percentile(nz, 95)) if nz.size else None
         for col, compact in enumerate(compacts):
             ax = axes[row, col]
             labels_ws = watershed(-smoothed, markers=marker_img_base.copy(), compactness=compact)
-            ax.scatter(latent_coords[sort_idx_freq, 0], latent_coords[sort_idx_freq, 1],
-                       c=mean_freqs[sort_idx_freq], cmap='viridis',
-                       s=scatter_size, alpha=scatter_alpha,
-                       rasterized=True, linewidth=0, marker='.', edgecolors='none')
+            # Show the smoothed heatmap watershed actually operates on — lets
+            # you judge whether boundaries fall at density valleys.
+            ax.imshow(smoothed, origin='lower', extent=(0, 1, 0, 1),
+                      cmap='viridis', vmin=0, vmax=vmax, aspect='equal',
+                      interpolation='nearest')
             boundary_levels = np.arange(0.5, len(centers) + 1.5)
             ax.contour(xx, yy, labels_ws, levels=boundary_levels,
-                       colors='black', linewidths=2.5)
+                       colors='white', linewidths=1.5)
             ax.scatter(centers[:, 0], centers[:, 1],
-                       c='black', s=80, marker='x', linewidths=2.0, zorder=10)
+                       c='white', s=80, marker='x', linewidths=2.0, zorder=10)
             ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.set_aspect('equal')
             ax.set_xticks([]); ax.set_yticks([])
             if row == 0:
@@ -571,7 +634,7 @@ def figure_H_watershed_variants(heatmap, centers, latent_coords, mean_freqs,
 
 def figure_watershed_overlay(
     latent_coords, ws_labels, centers,
-    lattice_np, aggregated,
+    heatmap_right,
     durations,
     scatter_size, scatter_alpha,
     save_path,
@@ -579,7 +642,7 @@ def figure_watershed_overlay(
     """
     Two-panel figure with watershed boundaries overlaid on:
       left  — scatter colored by duration
-      right — aggregated posterior as a lattice-point scatter (sharp, unblurred)
+      right — aggregated posterior heatmap (slightly less smoothed than FG left)
     """
     res = ws_labels.shape[0]
     n_clusters = len(centers)
@@ -623,19 +686,15 @@ def figure_watershed_overlay(
     ax.set_title('Duration', fontsize=13, fontweight='bold')
     _add_watershed(ax)
 
-    # --- Right: aggregated posterior as lattice-point scatter (sharp) ---
+    # --- Right: aggregated posterior heatmap (less smoothed, same style as FG left) ---
     ax = axes[1]
-    agg = np.asarray(aggregated, dtype=float)
-    sort_idx_agg = np.argsort(agg)  # draw low-weight points first
-    vmax_agg = float(np.percentile(agg[agg > 0], 99)) if (agg > 0).any() else None
-    sc2 = ax.scatter(
-        lattice_np[sort_idx_agg, 0], lattice_np[sort_idx_agg, 1],
-        c=agg[sort_idx_agg], cmap='viridis', vmin=0, vmax=vmax_agg,
-        s=scatter_size * 2, alpha=0.8,
-        rasterized=True, linewidth=0, marker='.', edgecolors='none',
+    nz = heatmap_right[heatmap_right > 0]
+    agg_vmax = float(np.percentile(nz, 95)) if nz.size else None
+    im2 = ax.imshow(
+        heatmap_right, origin='lower', extent=extent, cmap='viridis',
+        interpolation=None, vmin=0, vmax=agg_vmax, aspect='equal',
     )
-    ax.set_facecolor('black')
-    cbar = plt.colorbar(sc2, ax=ax, shrink=0.6)
+    cbar = plt.colorbar(im2, ax=ax, shrink=0.6)
     cbar.solids.set_alpha(1)
     cbar.set_label('Aggregated posterior', fontsize=10)
     ax.set_title('Aggregated posterior', fontsize=13, fontweight='bold')
@@ -644,6 +703,53 @@ def figure_watershed_overlay(
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f'Saved: {os.path.basename(save_path)}')
+    plt.close()
+
+
+def plot_recon_bars(mse_arr, mask_counts, durations, save_dir, n_dur_bins=5):
+    """Bar chart of mean reconstruction MSE grouped by mask count and duration bin."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    # --- by mask count ---
+    ax = axes[0]
+    unique_mls = np.sort(np.unique(mask_counts))
+    means = [mse_arr[mask_counts == ml].mean() for ml in unique_mls]
+    sems  = [mse_arr[mask_counts == ml].std() / max(1, np.sqrt((mask_counts == ml).sum()))
+             for ml in unique_mls]
+    ax.bar(np.arange(len(unique_mls)), means, yerr=sems, capsize=3,
+           color='steelblue', alpha=0.8, edgecolor='white')
+    ax.set_xticks(np.arange(len(unique_mls)))
+    ax.set_xticklabels([str(int(m)) for m in unique_mls])
+    ax.set_xlabel('masks_len (syllable length bins)', fontsize=11)
+    ax.set_ylabel('Mean reconstruction MSE', fontsize=11)
+    ax.set_title('Reconstruction MSE by mask count', fontsize=12, fontweight='bold')
+
+    # --- by duration bin ---
+    ax = axes[1]
+    bin_edges = np.percentile(durations, np.linspace(0, 100, n_dur_bins + 1))
+    bin_edges[0]  -= 1
+    bin_edges[-1] += 1
+    bin_labels, bin_means, bin_sems = [], [], []
+    for b in range(n_dur_bins):
+        lo, hi = bin_edges[b], bin_edges[b + 1]
+        mask = (durations >= lo) & (durations < hi)
+        if mask.sum() == 0:
+            continue
+        bin_labels.append(f'[{lo:.0f},{hi:.0f})')
+        bin_means.append(mse_arr[mask].mean())
+        bin_sems.append(mse_arr[mask].std() / max(1, np.sqrt(mask.sum())))
+    ax.bar(np.arange(len(bin_means)), bin_means, yerr=bin_sems, capsize=3,
+           color='darkorange', alpha=0.8, edgecolor='white')
+    ax.set_xticks(np.arange(len(bin_labels)))
+    ax.set_xticklabels(bin_labels, rotation=30, ha='right', fontsize=9)
+    ax.set_xlabel('Duration (samples)', fontsize=11)
+    ax.set_ylabel('Mean reconstruction MSE', fontsize=11)
+    ax.set_title('Reconstruction MSE by duration', fontsize=12, fontweight='bold')
+
+    plt.tight_layout()
+    out_path = os.path.join(save_dir, 'figure_recon_mse_bars.png')
+    plt.savefig(out_path, dpi=200, bbox_inches='tight')
+    print(f'Saved: figure_recon_mse_bars.png')
     plt.close()
 
 
@@ -664,6 +770,23 @@ def analyze_mouse_latents(
     grid_size=15,
     n_per_cluster=16,
     sample_from_centroid=False,
+    cache_posteriors=False,
+    # reconstruction diagnostics
+    compute_recon=True,
+    recon_batch_size=64,
+    n_dur_bins=5,
+    # mean-shift algorithm selection
+    use_fast_mean_shift=False,
+    ms_k_neighbors=8,
+    ms_seed_percentile=50,
+    ms_max_iter=300,
+    ms_tol=1e-5,
+    # conditional model support
+    conditional=None,   # one of: "mask_count", "duration", "mean_freq", or None
+    # data filtering
+    filter_mask=True,
+    lo=1,
+    hi=8,
 ):
     """
     Generate latent space analysis figures for mouse vocalization model.
@@ -679,10 +802,36 @@ def analyze_mouse_latents(
         scatter_size: Point size for scatter plot (default 3)
         scatter_alpha: Transparency for scatter plot (default 0.3)
         beh_features_path: Path to pkl with {session_id -> DataFrame(avg_social_distance, emitter_sex)}
+        cache_posteriors: If True, save/load posterior summaries to/from save_dir/posterior_cache.npz
+        compute_recon: If True, compute round-trip MSE and save bar charts
+        recon_batch_size: Batch size for reconstruction MSE computation
+        n_dur_bins: Number of duration quantile bins for the bar chart
+        use_fast_mean_shift: If True, use run_mean_shift_fast (lattice-based) instead of run_mean_shift
+        ms_k_neighbors: k-neighbor size for local-max seed detection (fast mean-shift only)
+        ms_seed_percentile: Weight percentile threshold for seed selection; 0=all local maxima,
+            50=above-median local maxima. Higher = fewer seeds, faster, may miss shallow modes.
+        ms_max_iter: Max iterations for fast mean-shift
+        ms_tol: Convergence threshold relative to bandwidth (fast mean-shift only)
+        conditional: name of conditioning variable from CONDITIONAL_REGISTRY, or None for
+            unconditional models. When set the decoder's first linear layer is widened
+            by c_dim and conditioning tensors are extracted per-batch from the dataset.
+            Choices: "mask_count" (8-D one-hot), "duration" (scalar), "mean_freq" (scalar).
+        filter_mask: If True, filter dataset to syllables whose masks_len is in [lo, hi].
+        lo: Lower bound (inclusive) on masks_len when filter_mask=True.
+        hi: Upper bound (inclusive) on masks_len when filter_mask=True.
     """
 
     # Setup
     os.makedirs(save_dir, exist_ok=True)
+
+    if conditional is not None and conditional not in CONDITIONAL_REGISTRY:
+        raise ValueError(
+            f"Unknown conditional: {conditional!r}. "
+            f"Choose from: {list(CONDITIONAL_REGISTRY)} or None."
+        )
+    c_dim = CONDITIONAL_REGISTRY[conditional]["c_dim"] if conditional is not None else 0
+    if conditional is not None:
+        print(f"Conditional mode: {conditional!r}  ({CONDITIONAL_REGISTRY[conditional]['label']},  c_dim={c_dim})")
 
     # Load behavioral features (session_id -> DataFrame)
     import pickle
@@ -701,7 +850,7 @@ def analyze_mouse_latents(
     # test_ds = mouse_data(train_dict, masks_len_range=(1, 8), equal_sampling=True, max_samples=max_samples)
     
     full_dict = torch.load(os.path.join(dataloc, 'full_data.pt'), mmap=True)
-    full_ds = mouse_data(full_dict, filter_mask=True, lo=1, hi=8,
+    full_ds = mouse_data(full_dict, filter_mask=filter_mask, lo=lo, hi=hi,
                          sampling_strategy='subsample', total_samples=total_samples)
     
     n_workers = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else 4
@@ -711,10 +860,11 @@ def analyze_mouse_latents(
     print("Loading model...")
     latent_dim = 2
 
-    # This is the architecture from bartul_mouse.py - adjust if yours differs
+    # Architecture must match training (bartul_mouse.py or bartul_mouse_cond.py).
+    # When a conditional is used, the first linear layer is widened by c_dim.
     import torch.nn as nn
     decoder = nn.Sequential(
-        nn.Linear(2*latent_dim, 2048),
+        nn.Linear(2*latent_dim + c_dim, 2048),
         nn.Linear(2048, 64*8*8),
         nn.Unflatten(1, (64, 8, 8)),
         nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
@@ -741,9 +891,24 @@ def analyze_mouse_latents(
     print(f"Lattice size: {len(lattice)} points")
 
     # Compute posteriors for all test samples (streaming — never materializes full matrix)
-    print("Computing posteriors...")
     lattice_np = lattice.numpy()
-    torus_weighted, aggregated, weights = get_posterior_summaries(model, lattice, test_loader, binary_lp)
+    cache_path = os.path.join(save_dir, 'posterior_cache.npz')
+    if cache_posteriors and os.path.exists(cache_path):
+        print(f"Loading cached posteriors from {cache_path}...")
+        cache = np.load(cache_path)
+        torus_weighted, aggregated, weights = cache['torus_weighted'], cache['aggregated'], cache['weights']
+    else:
+        print("Computing posteriors...")
+        c_fn = _make_c_fn(conditional, device) if conditional is not None else None
+        if conditional is not None and batch_size > 1:
+            print(f"  Warning: batch_size={batch_size} with conditional model — posterior uses "
+                  f"batch-mean c, not per-sample c. Set batch_size=1 for exact per-sample conditioning.")
+        torus_weighted, aggregated, weights = get_posterior_summaries(
+            model, lattice, test_loader, binary_lp, c_fn=c_fn
+        )
+        if cache_posteriors:
+            np.savez(cache_path, torus_weighted=torus_weighted, aggregated=aggregated, weights=weights)
+            print(f"Cached posteriors to {cache_path}")
 
     # Posterior mean embedding (torus-aware, continuous)
     latent_coords = torus_reverse(torus_weighted, dim=2)      # (n_samples, 2)
@@ -790,7 +955,34 @@ def analyze_mouse_latents(
     mean_freqs = np.concatenate(mean_freqs_list)
     mask_counts = np.concatenate(mask_counts_list)
     durations   = np.concatenate(durations_list)
-    
+
+    # ============= Reconstruction MSE bar charts =============
+    if compute_recon:
+        print("\nComputing reconstruction MSE...")
+        from train.losses import binary_lp as _lp_fnc
+        all_mse = []
+        model.eval()
+        with torch.no_grad():
+            for start in tqdm(range(0, len(full_ds), recon_batch_size), desc="recon MSE"):
+                end = min(start + recon_batch_size, len(full_ds))
+                items = [full_ds[i] for i in range(start, end)]
+                specs = torch.stack([it[0] for it in items]).to(torch.float32).to(device)
+                if conditional is not None:
+                    c_vals = torch.stack([
+                        _get_sample_c(full_ds, idx, conditional, device).squeeze(0)
+                        for idx in range(start, end)
+                    ])                                          # (B, c_dim)
+                    c_batch = c_vals.mean(dim=0, keepdim=True) # (1, c_dim)
+                    recon = model.round_trip(lattice.to(device), specs, _lp_fnc, c=c_batch)
+                else:
+                    recon = model.round_trip(lattice.to(device), specs, _lp_fnc)
+                mse = ((recon.cpu() - specs.cpu()) ** 2).mean(dim=(1, 2, 3)).numpy()
+                all_mse.extend(mse.tolist())
+        model.eval()  # keep in eval for subsequent figure generation
+        mse_arr = np.array(all_mse, dtype=np.float32)
+        print(f"  Mean MSE: {mse_arr.mean():.4f}  (std {mse_arr.std():.4f})")
+        plot_recon_bars(mse_arr, mask_counts, durations, save_dir, n_dur_bins=n_dur_bins)
+
     print(f"Number of samples: {len(latent_coords)}")
     print(f"Latent coords range: X=[{latent_coords[:, 0].min():.3f}, {latent_coords[:, 0].max():.3f}], Y=[{latent_coords[:,1].min():.3f}, {latent_coords[:, 1].max():.3f}]")
     print(f"Unique points: {len(np.unique(latent_coords, axis=0))}")
@@ -1169,20 +1361,38 @@ def analyze_mouse_latents(
     print("Running mean-shift clustering...")
     embedded = torus_forward(latent_coords)
 
-    centers, wms, labels = run_mean_shift(
-        embedded,
-        seeds=embedded,  # Use all points as seeds
-        weights=weights,
-        bandwidth=bandwidth,
-        n_jobs=min(16, n_workers),
-        p=2,
-        embedded=True,
-        normal=False
-    )
-    
-    labels=np.atleast_1d(labels)
+    if use_fast_mean_shift:
+        print("  Using run_mean_shift_fast (lattice-based)...")
+        lattice_embedded = torus_forward(lattice_np)   # (N_lattice, 4)
+        centers, _lattice_labels, _seed_mask = run_mean_shift_fast(
+            lattice_embedded,
+            aggregated,
+            bandwidth=bandwidth,
+            k_neighbors=ms_k_neighbors,
+            seed_percentile=ms_seed_percentile,
+            max_iter=ms_max_iter,
+            tol=ms_tol,
+            embedded=True,
+        )
+        # Assign per-sample labels by nearest center in torus-embedded space
+        from scipy.spatial import cKDTree as _cKDTree
+        centers_embedded = torus_forward(centers)
+        _, labels = _cKDTree(centers_embedded).query(embedded)
+    else:
+        centers, wms, labels = run_mean_shift(
+            embedded,
+            seeds=embedded,  # Use all points as seeds
+            weights=weights,
+            bandwidth=bandwidth,
+            n_jobs=min(16, n_workers),
+            p=2,
+            embedded=True,
+            normal=False
+        )
 
-    # centers are in [0,1]^2 after torus_reverse inside run_mean_shift
+    labels = np.atleast_1d(labels)
+
+    # centers are in [0,1]^2 after torus_reverse inside run_mean_shift / run_mean_shift_fast
     print(f"Found {len(centers)} clusters")
 
     # ============= FIGURE FG: Aggregated posterior + cluster example spectrograms =============
@@ -1192,7 +1402,8 @@ def analyze_mouse_latents(
     n_rows_g = int(np.ceil(n_clusters_found / n_cols_g))
 
     import matplotlib.gridspec as gridspec
-    fig = plt.figure(figsize=(6 + n_cols_g * 2, max(6, n_rows_g * 2)))
+    fig_height = max(5, n_rows_g * 2 + 1) if n_rows_g > 1 else 4
+    fig = plt.figure(figsize=(6 + n_cols_g * 2, fig_height))
     outer = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[1, 1.1], wspace=0.15)
 
     ax = fig.add_subplot(outer[0, 0])
@@ -1245,9 +1456,30 @@ def analyze_mouse_latents(
 
     # ============= Grid reconstructions =============
     print("\nGenerating grid reconstructions...")
-    grid_examples(model, grid_size,
-                  save_path=os.path.join(save_dir, 'figure_grid_examples.png'),
-                  device=device)
+    if conditional is not None:
+        # For conditional models generate one grid per sweep value and also a
+        # mean-c grid for a compact single overview.
+        from bartul_mouse_cond import get_grid_sweep
+        sweep = get_grid_sweep(conditional)
+        for val_label, c_val in sweep:
+            grid_examples(
+                model, grid_size,
+                save_path=os.path.join(save_dir, f'figure_grid_examples_{conditional}_{val_label}.png'),
+                device=device, c=c_val.to(device),
+            )
+        # Also produce a mean-conditioning overview grid
+        fi = CONDITIONAL_REGISTRY[conditional]["field_idx"]
+        mean_c = torch.stack([
+            full_ds[i][fi].float() if full_ds[i][fi].dim() > 0 else full_ds[i][fi].float().unsqueeze(0)
+            for i in range(min(500, len(full_ds)))
+        ]).mean(dim=0, keepdim=True).to(device)   # (1, c_dim)
+        grid_examples(model, grid_size,
+                      save_path=os.path.join(save_dir, 'figure_grid_examples.png'),
+                      device=device, c=mean_c)
+    else:
+        grid_examples(model, grid_size,
+                      save_path=os.path.join(save_dir, 'figure_grid_examples.png'),
+                      device=device)
 
     # ============= FIGURE H: Random samples per watershed cluster (one fig per cluster) =============
     print("\nGenerating Figure H: Random samples per cluster (watershed σ=3, compact=0)...")
@@ -1272,16 +1504,25 @@ def analyze_mouse_latents(
 
     # ============= FIGURE FH: Duration scatter + aggregated posterior with watershed =============
     print("\nGenerating Figure FH: Watershed overlay...")
+    # Slightly less smoothing than FG left (sigma=1.5) — for plotting only
+    heatmap_fh_right = gaussian_filter(heatmap_samples, sigma=0.8, mode='wrap')
     figure_watershed_overlay(
         latent_coords=latent_coords,
         ws_labels=ws_labels,
         centers=centers,
-        lattice_np=lattice_np,
-        aggregated=aggregated,
+        heatmap_right=heatmap_fh_right,
         durations=durations,
         scatter_size=scatter_size,
         scatter_alpha=scatter_alpha,
         save_path=os.path.join(save_dir, 'figure_FH_watershed_overlay.png'),
+    )
+
+    # ============= FIGURE H watershed grid search =============
+    print("\nGenerating Figure H: Watershed grid search (σ × compactness)...")
+    figure_H_watershed_variants(
+        heatmap_lattice, centers, latent_coords, mean_freqs,
+        scatter_size, scatter_alpha,
+        save_path=os.path.join(save_dir, 'figure_H_watershed_grid.png'),
     )
 
     n_clusters_found = len(centers)

@@ -81,6 +81,39 @@ Post-training analysis tools:
 - `clustering.py` — mean-shift and k-means on torus-periodic latent space
 - `geodesics.py`, `tda.py` — topological and geometric analysis of learned representations
 
+## Latent Space Geometry: Torus Structure and Distances
+
+The latent space is a **torus** [0,1]^d with periodic boundary conditions (0 ≡ 1 in every dimension). This affects how coordinates are computed and how distances must be measured.
+
+### Mapping data → latent coords (torus → grid)
+
+`get_posterior_summaries` (`analysis/model_helpers.py`) runs inference without materializing the full posterior matrix:
+
+1. **Torus embedding** — each lattice point `z ∈ [0,1]^d` is lifted to a 2d-dimensional torus embedding via `torus_forward`: `[cos(2π·z), sin(2π·z)]`
+2. **Posterior-weighted mean** — for each data sample `x`, compute `p(z_j | x)` over all lattice points and take the weighted sum in torus-embedded space: `torus_weighted[x] = Σ_j p(z_j|x) · [cos(2π·z_j), sin(2π·z_j)]`
+3. **Invert to [0,1]^d** — `torus_reverse` applies `arctan2(sin, cos)`, wraps negative angles to [0, 2π], divides by 2π. This is a correct circular mean that handles wrap-around at 0≡1.
+4. **Clamp** — `% 1.0` guards against floating-point edge cases.
+
+### Computing distances between latent coords
+
+**Do not use plain Euclidean distance** on the [0,1]^d coordinates — it incorrectly treats 0.001 and 0.999 as far apart when they are adjacent on the torus.
+
+**Option 1 — Torus geodesic (preferred for reporting distances):**
+```python
+def torus_dist(a, b):
+    """Geodesic distance on [0,1]^d torus. a, b: (..., d)"""
+    diff = np.abs(a - b)
+    diff = np.minimum(diff, 1.0 - diff)
+    return np.sqrt((diff ** 2).sum(axis=-1))
+```
+
+**Option 2 — Embedded Euclidean (useful for KD-trees, clustering):**
+```python
+from analysis.model_helpers import torus_forward
+dist = np.sqrt(((torus_forward(a) - torus_forward(b)) ** 2).sum(axis=-1))
+```
+This equals `sqrt(Σ_i 2(1 - cos(2π·Δz_i)))` — a proper metric, monotone with geodesic distance but not identical to arc length.
+
 ## Code Conventions
 
 - Models return distributions (or tensors) from `forward()`; evidence is computed externally in `losses.py`

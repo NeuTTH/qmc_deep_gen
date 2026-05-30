@@ -338,6 +338,26 @@ class mouse_data(Dataset):
         self.durations    = durations
         self.spec_ids     = spec_ids
         self.seed         = seed
+
+        # --- Precomputed conditional fields ---
+        # Normalized duration: min-max over this (filtered/sampled) dataset → [0, 1]
+        dur = self.durations.float()
+        self.norm_durations = (dur - dur.min()) / (dur.max() - dur.min() + 1e-8)
+
+        # Mean frequency: energy-weighted centroid of frequency axis → [0, 1]
+        # spectrograms shape: (N, H, W); frequency axis = dim 1
+        specs_f = self.spectrograms.float()                                      # (N, H, W)
+        H_freq  = specs_f.shape[1]
+        freq_bins = torch.arange(H_freq, dtype=torch.float32).unsqueeze(0).unsqueeze(2)  # (1, H, 1)
+        energy        = specs_f.sum(dim=(1, 2)).clamp(min=1e-8)                 # (N,)
+        weighted_freq = (specs_f * freq_bins).sum(dim=(1, 2))                   # (N,)
+        self.mean_freqs = (weighted_freq / energy) / H_freq                     # (N,) in [0, 1]
+
+        # One-hot mask count: 8 classes (masks_len 1–8 → indices 0–7)
+        ml_idx = self.masks_len.long().clamp(1, 8) - 1                          # (N,) in [0, 7]
+        self.mask_count_onehot = torch.zeros(len(ml_idx), 8)
+        self.mask_count_onehot.scatter_(1, ml_idx.unsqueeze(1), 1.0)            # (N, 8)
+
         self.sampling_config = {
             'filter_mask':       filter_mask,
             'lo':                lo if filter_mask else None,
@@ -369,7 +389,16 @@ class mouse_data(Dataset):
         binary_mask = (mask > 0.5).float().unsqueeze(0)   # 1 x H x W
         spec = spec * binary_mask
 
-        return (spec, ml.float(), duration.float(), mask, spec_id)
+        return (
+            spec,                              # 0: 1 x H x W
+            ml.float(),                        # 1: scalar (masks_len)
+            duration.float(),                  # 2: scalar (raw duration)
+            self.norm_durations[index],        # 3: scalar (normalized duration)
+            self.mean_freqs[index],            # 4: scalar (mean frequency)
+            self.mask_count_onehot[index],     # 5: (8,) one-hot mask count
+            mask,                              # 6: H x W
+            spec_id,                           # 7: str
+        )
                                                                                                                     
 def print_masks_len_stats(masks_len, label=''):
     """Print distribution of masks_len values."""                                                                      

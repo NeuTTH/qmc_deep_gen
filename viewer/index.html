@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QLVM Latent Explorer</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body, #root { width: 100%; height: 100%; overflow: hidden; background: #0d0d1a; }
+  body { font-family: 'Helvetica Neue', Arial, sans-serif; color: #ccc; }
+  select, input[type=checkbox] { accent-color: #4a9eff; }
+  select { background: #1e1e2e; color: #ccc; border: 1px solid #444; border-radius: 4px;
+           padding: 3px 6px; font-size: 12px; cursor: pointer; }
+  select:focus { outline: none; border-color: #4a9eff; }
+  label { font-size: 12px; color: #aaa; display: flex; align-items: center; gap: 5px;
+          cursor: pointer; user-select: none; }
+  label:hover { color: #ddd; }
+  h4 { font-size: 12px; font-weight: 600; color: #888; margin-bottom: 8px; letter-spacing: 0.05em; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ── Palette (matplotlib tab20) ───────────────────────────────────────────────
+const TAB20 = [
+  '#1f77b4','#aec7e8','#ff7f0e','#ffbb78','#2ca02c',
+  '#98df8a','#d62728','#ff9896','#9467bd','#c5b0d5',
+  '#8c564b','#c49c94','#e377c2','#f7b6d2','#7f7f7f',
+  '#c7c7c7','#bcbd22','#dbdb8d','#17becf','#9edae5',
+];
+
+// Viridis LUT (31 stops, index 0=0.0 … 30=1.0)
+const VIRIDIS = [
+  [68,1,84],[71,13,96],[72,24,107],[71,35,117],[69,45,124],
+  [64,55,131],[57,65,137],[50,73,141],[43,82,145],[37,91,148],
+  [31,100,151],[26,108,153],[22,116,154],[20,124,155],[20,131,154],
+  [21,138,152],[24,145,149],[30,152,144],[39,158,137],[51,164,130],
+  [65,170,121],[81,176,112],[97,180,103],[115,186,94],[135,190,84],
+  [156,194,74],[177,198,63],[198,202,53],[219,206,43],[240,210,35],
+  [253,231,37],
+];
+function viridisRGB(t) {
+  const n = VIRIDIS.length - 1;
+  const i = Math.max(0, Math.min(n, Math.round(t * n)));
+  return VIRIDIS[i];
+}
+
+// ── Coordinate transforms ────────────────────────────────────────────────────
+// Data coords: x,y ∈ [0,1], y=0 = bottom (origin='lower').
+// Equal scaling on both axes so [0,1]² renders as a square.
+function dataToCv(dx, dy, vp, W, H) {
+  const s = vp.zoom * Math.min(W, H);
+  return [
+    (dx - vp.cx) * s + W * 0.5,
+    H * 0.5 - (dy - vp.cy) * s,
+  ];
+}
+function cvToData(sx, sy, vp, W, H) {
+  const s = vp.zoom * Math.min(W, H);
+  return [
+    (sx - W * 0.5) / s + vp.cx,
+    vp.cy - (sy - H * 0.5) / s,
+  ];
+}
+
+// ── Toroidal distance (squared) ──────────────────────────────────────────────
+function tDist2(ax, ay, bx, by) {
+  const dx = Math.abs(ax - bx);
+  const dy = Math.abs(ay - by);
+  const tdx = Math.min(dx, 1 - dx);
+  const tdy = Math.min(dy, 1 - dy);
+  return tdx * tdx + tdy * tdy;
+}
+
+// ── Nearest-point lookup (linear scan with toroidal distance) ────────────────
+// maxDataDist: search radius in data coords (typically 15px / (zoom * min(W,H)))
+// isActiveFilter: optional (i) => bool — only consider points where it returns true
+function findNearest(px, py, xs, ys, maxDataDist, isActiveFilter) {
+  const maxD2 = maxDataDist * maxDataDist;
+  // Wrap query to [0,1]
+  px = ((px % 1) + 1) % 1;
+  py = ((py % 1) + 1) % 1;
+  let best = -1, bestD2 = maxD2;
+  for (let i = 0, N = xs.length; i < N; i++) {
+    if (isActiveFilter && !isActiveFilter(i)) continue;
+    const dx = Math.abs(xs[i] - px);
+    if (dx > maxDataDist && (1 - dx) > maxDataDist) continue;
+    const dy = Math.abs(ys[i] - py);
+    if (dy > maxDataDist && (1 - dy) > maxDataDist) continue;
+    const d2 = tDist2(xs[i], ys[i], px, py);
+    if (d2 < bestD2) { best = i; bestD2 = d2; }
+  }
+  return best < 0 ? null : best;
+}
+
+// ── Build viridis heatmap offscreen canvas ────────────────────────────────────
+// heatmap: (res, res) nested array, row=y-index, col=x-index (y=0 = bottom)
+function buildHeatmapCanvas(heatmap, res) {
+  const ofc = document.createElement('canvas');
+  ofc.width = res;
+  ofc.height = res;
+  const ctx = ofc.getContext('2d');
+  const img = ctx.createImageData(res, res);
+  const d = img.data;
+
+  // 95th-percentile normalisation (same as Python plotting)
+  const flatNonzero = [];
+  for (let r = 0; r < res; r++)
+    for (let c = 0; c < res; c++)
+      if (heatmap[r][c] > 0) flatNonzero.push(heatmap[r][c]);
+  flatNonzero.sort((a, b) => a - b);
+  const vmax = flatNonzero.length
+    ? flatNonzero[Math.floor(0.95 * flatNonzero.length)]
+    : 1;
+
+  for (let imgRow = 0; imgRow < res; imgRow++) {
+    // Flip y: image row 0 = data y=1 (top of data space)
+    const dataRow = res - 1 - imgRow;
+    for (let col = 0; col < res; col++) {
+      const val = Math.min(1, heatmap[dataRow][col] / vmax);
+      const [r, g, b] = viridisRGB(val);
+      const idx = (imgRow * res + col) * 4;
+      d[idx]   = r;
+      d[idx+1] = g;
+      d[idx+2] = b;
+      d[idx+3] = val > 0 ? Math.min(220, val * 255) : 0;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return ofc;
+}
+
+// ── Tile offsets for 3×3 tiled view ─────────────────────────────────────────
+const SINGLE_TILE = [[0, 0]];
+const NINE_TILES  = [
+  [-1,-1],[-1,0],[-1,1],
+  [ 0,-1],[ 0,0],[ 0,1],
+  [ 1,-1],[ 1,0],[ 1,1],
+];
+
+// ── Canvas render ─────────────────────────────────────────────────────────────
+function renderCanvas(canvas, heatmapOfc, data, vp, selected, hovered, ui) {
+  if (!canvas || !data) return;
+  const ctx  = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const { points, overlays, meta } = data;
+  const { x: xs, y: ys } = points;
+  const N = xs.length;
+  const K = meta.n_clusters;
+
+  // Label arrays: determine active label source
+  const wsLabel = (ui.colorMode === 'cluster_std')
+    ? points.ws_label
+    : points.ws_label_periodic;
+
+  const tiles = ui.tiledView ? NINE_TILES : SINGLE_TILE;
+
+  // ── Background ──────────────────────────────────────────────────────────
+  ctx.fillStyle = '#0d0d1a';
+  ctx.fillRect(0, 0, W, H);
+
+  // ── Heatmap underlay ─────────────────────────────────────────────────────
+  if (ui.showHeatmap && heatmapOfc) {
+    // data(0,1)=top-left, data(1,0)=bottom-right in canvas coords
+    for (const [dlat, dlng] of tiles) {
+      const [lx, ty] = dataToCv(0 + dlng, 1 + dlat, vp, W, H);
+      const [rx, by] = dataToCv(1 + dlng, 0 + dlat, vp, W, H);
+      if (rx < 0 || lx > W || by < 0 || ty > H) continue;
+      ctx.globalAlpha = 0.65;
+      ctx.drawImage(heatmapOfc, lx, ty, rx - lx, by - ty);
+      ctx.globalAlpha = 1.0;
+    }
+  }
+
+  // ── Scatter points ────────────────────────────────────────────────────────
+  // Group by cluster for batched fillStyle (much faster than per-point changes)
+  const isolated    = ui.isolatedCluster;
+  const sessionFilt = ui.sessionFilter;
+
+  // Radius and alpha for each rendering tier
+  const R_ACTIVE = isolated !== null ? 4.5 : 3.5;   // active/visible points
+  const R_GHOST  = 2;                                 // ghosted non-isolated points
+
+  // Compute per-cluster groups of canvas-culled positions
+  const groups = {};  // label → [sx, sy, ...]
+  for (const [dlat, dlng] of tiles) {
+    const margin = R_ACTIVE + 1;
+    for (let i = 0; i < N; i++) {
+      // Session filter (ghost if not matching, same as isolation ghost)
+      const sessionMatch = !sessionFilt || points.session_id[i] === sessionFilt;
+      const lbl = wsLabel[i];
+      const clusterMatch = isolated === null || lbl === isolated;
+      if (!sessionMatch && !clusterMatch) continue;   // fully skip: not active on any axis
+
+      const [sx, sy] = dataToCv(xs[i] + dlng, ys[i] + dlat, vp, W, H);
+      if (sx < -margin || sx > W + margin || sy < -margin || sy > H + margin) continue;
+
+      // key=0 → ghost tier; key=lbl → active tier
+      const active = sessionMatch && clusterMatch;
+      const key = active ? lbl : 0;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(sx, sy);
+    }
+
+    // Ghost layer — small, barely visible (use fillRect for speed)
+    if (groups[0]) {
+      ctx.globalAlpha = 0.07;
+      ctx.fillStyle = '#aaa';
+      const pts = groups[0];
+      for (let j = 0; j < pts.length; j += 2)
+        ctx.fillRect(pts[j] - R_GHOST, pts[j + 1] - R_GHOST, R_GHOST * 2, R_GHOST * 2);
+      ctx.globalAlpha = 1.0;
+      delete groups[0];
+    }
+
+    // Active clusters — circles, batched per color for performance
+    for (const [lbl, pts] of Object.entries(groups)) {
+      const c = parseInt(lbl) - 1;
+      ctx.fillStyle = ui.colorMode === 'none' ? '#999' : (TAB20[c % TAB20.length] || '#999');
+      ctx.globalAlpha = isolated !== null ? 0.75 : 0.55;
+      ctx.beginPath();
+      for (let j = 0; j < pts.length; j += 2) {
+        // moveTo avoids implicit lineTo from previous arc
+        ctx.moveTo(pts[j] + R_ACTIVE, pts[j + 1]);
+        ctx.arc(pts[j], pts[j + 1], R_ACTIVE, 0, 2 * Math.PI);
+      }
+      ctx.fill();
+      ctx.globalAlpha = 1.0;
+    }
+    // Reset groups for next tile
+    for (const k in groups) delete groups[k];
+  }
+
+  // ── Boundary contours ──────────────────────────────────────────────────────
+  if (ui.showBoundaries) {
+    const contours = ui.boundaryMode === 'periodic'
+      ? overlays.boundary_contours.periodic
+      : overlays.boundary_contours.standard;
+
+    for (const [dlat, dlng] of tiles) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+      ctx.lineWidth   = 1.0;
+
+      for (const poly of contours) {
+        if (poly.length < 2) continue;
+        ctx.beginPath();
+        const [x0, y0] = dataToCv(poly[0][0] + dlng, poly[0][1] + dlat, vp, W, H);
+        ctx.moveTo(x0, y0);
+        for (let j = 1; j < poly.length; j++) {
+          const [px, py] = dataToCv(poly[j][0] + dlng, poly[j][1] + dlat, vp, W, H);
+          ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+      }
+    }
+  }
+
+  // ── Cluster center markers ────────────────────────────────────────────────
+  if (ui.showPeaks && overlays.centers) {
+    for (const [dlat, dlng] of tiles) {
+      overlays.centers.forEach(([cx0, cy0], ci) => {
+        const [sx, sy] = dataToCv(cx0 + dlng, cy0 + dlat, vp, W, H);
+        if (sx < -16 || sx > W + 16 || sy < -16 || sy > H + 16) return;
+        const isActive = isolated === null || isolated === ci + 1;
+        ctx.strokeStyle = isActive ? 'white' : 'rgba(200,200,200,0.25)';
+        ctx.lineWidth   = isActive ? 2.0 : 1.0;
+        ctx.beginPath();
+        ctx.moveTo(sx - 8, sy); ctx.lineTo(sx + 8, sy);
+        ctx.moveTo(sx, sy - 8); ctx.lineTo(sx, sy + 8);
+        ctx.stroke();
+        ctx.fillStyle = isActive ? 'white' : 'rgba(200,200,200,0.3)';
+        ctx.font = '10px sans-serif';
+        ctx.fillText(ci + 1, sx + 6, sy - 5);
+      });
+    }
+  }
+
+  // ── Tiled view: central tile border ──────────────────────────────────────
+  if (ui.tiledView) {
+    const [bx0, bty] = dataToCv(0, 1, vp, W, H);
+    const [bx1, bby] = dataToCv(1, 0, vp, W, H);
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(bx0, bty, bx1 - bx0, bby - bty);
+    ctx.setLineDash([]);
+  }
+
+  // ── Selected point ring ────────────────────────────────────────────────────
+  if (selected !== null) {
+    for (const [dlat, dlng] of tiles) {
+      const [sx, sy] = dataToCv(xs[selected] + dlng, ys[selected] + dlat, vp, W, H);
+      if (sx < -20 || sx > W + 20 || sy < -20 || sy > H + 20) continue;
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth   = 2.0;
+      ctx.beginPath();
+      ctx.arc(sx, sy, 9, 0, 2 * Math.PI);
+      ctx.stroke();
+    }
+  }
+
+  // ── Hover highlight + tooltip ─────────────────────────────────────────────
+  if (hovered !== null && hovered !== selected) {
+    const [sx, sy] = dataToCv(xs[hovered], ys[hovered], vp, W, H);
+    if (sx >= 0 && sx <= W && sy >= 0 && sy <= H) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(sx, sy, 6, 0, 2 * Math.PI);
+      ctx.stroke();
+
+      const lbl  = wsLabel[hovered];
+      const sess = points.session_id[hovered] || '__unknown__';
+      const tip  = `#${hovered} · cluster ${lbl} · ${sess}`;
+      ctx.font = '11px monospace';
+      const tw = ctx.measureText(tip).width;
+      const tx = Math.min(sx + 12, W - tw - 10);
+      const ty = Math.max(sy - 20, 14);
+      ctx.fillStyle = 'rgba(0,0,0,0.85)';
+      ctx.fillRect(tx - 4, ty - 13, tw + 8, 18);
+      ctx.fillStyle = '#eee';
+      ctx.fillText(tip, tx, ty);
+    }
+  }
+}
+
+// ── LatentCanvas ──────────────────────────────────────────────────────────────
+function LatentCanvas({ data, vp, setVp, selected, setSelected, hovered, setHovered, ui }) {
+  const canvasRef   = useRef(null);
+  const heatmapRef  = useRef(null);
+  const isDragging  = useRef(false);
+  const dragStart   = useRef(null);
+  const hoverTimerRef = useRef(null);
+
+  // Build heatmap offscreen canvas once when data loads
+  useEffect(() => {
+    if (!data) return;
+    heatmapRef.current = buildHeatmapCanvas(data.overlays.heatmap, data.meta.res);
+  }, [data]);
+
+  // Resize canvas to fill container
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      el.width  = el.offsetWidth;
+      el.height = el.offsetHeight;
+      renderCanvas(el, heatmapRef.current, data, vp, selected, hovered, ui);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Render whenever anything changes
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el || !data) return;
+    renderCanvas(el, heatmapRef.current, data, vp, selected, hovered, ui);
+  }, [data, vp, selected, hovered, ui]);
+
+  // Auto-center viewport on isolated cluster centroid
+  useEffect(() => {
+    if (ui.isolatedCluster === null || !data) return;
+    const [cx0, cy0] = data.overlays.centers[ui.isolatedCluster - 1];
+    setVp({ cx: cx0, cy: cy0, zoom: 4 });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ui.isolatedCluster]);
+
+  const getCanvasDataPt = useCallback((e) => {
+    const el = canvasRef.current;
+    const rect = el.getBoundingClientRect();
+    return cvToData(e.clientX - rect.left, e.clientY - rect.top,
+                    vp, el.width, el.height);
+  }, [vp]);
+
+  const handleWheel = useCallback((e) => {
+    e.preventDefault();
+    const el = canvasRef.current;
+    const rect = el.getBoundingClientRect();
+    const [dpx, dpy] = cvToData(e.clientX - rect.left, e.clientY - rect.top,
+                                 vp, el.width, el.height);
+    const factor   = e.deltaY < 0 ? 1.25 : 1 / 1.25;
+    const newZoom  = Math.max(0.4, Math.min(80, vp.zoom * factor));
+    // Zoom toward cursor
+    setVp({
+      cx:   dpx + (vp.cx - dpx) * (vp.zoom / newZoom),
+      cy:   dpy + (vp.cy - dpy) * (vp.zoom / newZoom),
+      zoom: newZoom,
+    });
+  }, [vp, setVp]);
+
+  const handleMouseDown = useCallback((e) => {
+    isDragging.current = true;
+    dragStart.current  = { mx: e.clientX, my: e.clientY, vp: { ...vp } };
+  }, [vp]);
+
+  // Build the active-point predicate from current UI filters
+  const makeActiveFilter = useCallback(() => {
+    if (!data) return null;
+    const wsLbl = ui.colorMode === 'cluster_std'
+      ? data.points.ws_label
+      : data.points.ws_label_periodic;
+    const { isolatedCluster, sessionFilter } = ui;
+    if (isolatedCluster === null && !sessionFilter) return null;  // no filter
+    return (i) => {
+      if (isolatedCluster !== null && wsLbl[i] !== isolatedCluster) return false;
+      if (sessionFilter && data.points.session_id[i] !== sessionFilter) return false;
+      return true;
+    };
+  }, [data, ui]);
+
+  const handleMouseMove = useCallback((e) => {
+    if (isDragging.current && dragStart.current) {
+      const el = canvasRef.current;
+      const dvp = dragStart.current.vp;
+      const s = dvp.zoom * Math.min(el.width, el.height);
+      setVp({
+        ...dvp,
+        cx: dvp.cx - (e.clientX - dragStart.current.mx) / s,
+        cy: dvp.cy + (e.clientY - dragStart.current.my) / s,
+      });
+      return;
+    }
+    if (!data) return;
+    // Throttle hover to ~30Hz
+    if (hoverTimerRef.current) return;
+    hoverTimerRef.current = setTimeout(() => { hoverTimerRef.current = null; }, 33);
+    const el = canvasRef.current;
+    const [dpx, dpy] = getCanvasDataPt(e);
+    const maxD = 15 / (vp.zoom * Math.min(el.width, el.height));
+    const nearest = findNearest(dpx, dpy, data.points.x, data.points.y, maxD, makeActiveFilter());
+    setHovered(nearest);
+  }, [data, vp, setVp, setHovered, getCanvasDataPt, makeActiveFilter]);
+
+  const handleMouseUp = useCallback(() => {
+    isDragging.current = false;
+    dragStart.current  = null;
+  }, []);
+
+  const handleClick = useCallback((e) => {
+    if (!data) return;
+    const el = canvasRef.current;
+    const [dpx, dpy] = getCanvasDataPt(e);
+    const maxD = 20 / (vp.zoom * Math.min(el.width, el.height));
+    const nearest = findNearest(dpx, dpy, data.points.x, data.points.y, maxD, makeActiveFilter());
+    setSelected(nearest);
+  }, [data, vp, setSelected, getCanvasDataPt, makeActiveFilter]);
+
+  const handleDblClick = useCallback(() => {
+    setVp({ cx: 0.5, cy: 0.5, zoom: 1 });
+  }, [setVp]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{ flex: '1 1 0', cursor: isDragging.current ? 'grabbing' : 'crosshair', minWidth: 0 }}
+      onWheel={handleWheel}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onClick={handleClick}
+      onDoubleClick={handleDblClick}
+      onMouseLeave={() => { setHovered(null); isDragging.current = false; }}
+    />
+  );
+}
+
+// ── SpectrogramPanel ──────────────────────────────────────────────────────────
+function SpectrogramPanel({ data, selected, setSelected }) {
+  const [neighbors, setNeighbors] = useState([]);
+
+  useEffect(() => {
+    if (selected === null || !data) { setNeighbors([]); return; }
+    const { x: xs, y: ys } = data.points;
+    const ax = xs[selected], ay = ys[selected];
+    const dists = Array.from({ length: xs.length }, (_, i) =>
+      ({ i, d: tDist2(xs[i], ys[i], ax, ay) })
+    );
+    dists.sort((a, b) => a.d - b.d);
+    setNeighbors(dists.slice(1, 9).map(d => d.i));
+  }, [selected, data]);
+
+  if (!data) {
+    return (
+      <div style={styles.panel}>
+        <div style={{ color: '#555', fontSize: 13 }}>Loading data…</div>
+      </div>
+    );
+  }
+
+  if (selected === null) {
+    const K = data.meta.n_clusters;
+    const sizes = data.overlays.cluster_sizes.periodic;
+    const maxSize = Math.max(...Object.values(sizes));
+    return (
+      <div style={styles.panel}>
+        <h4>Cluster sizes (periodic)</h4>
+        {Array.from({ length: K }, (_, i) => {
+          const c = i + 1;
+          const n = sizes[c] || 0;
+          return (
+            <div key={c} style={{ display: 'flex', alignItems: 'center', marginBottom: 5, gap: 8 }}>
+              <div style={{ width: 10, height: 10, background: TAB20[i % TAB20.length],
+                            borderRadius: 2, flexShrink: 0 }} />
+              <span style={{ width: 64, fontSize: 11, color: '#aaa' }}>Cluster {c}</span>
+              <div style={{ flex: 1, background: '#222', height: 7, borderRadius: 3 }}>
+                <div style={{ width: `${100 * n / maxSize}%`, height: '100%', borderRadius: 3,
+                               background: TAB20[i % TAB20.length] }} />
+              </div>
+              <span style={{ fontSize: 11, color: '#666', width: 52, textAlign: 'right' }}>
+                {n.toLocaleString()}
+              </span>
+            </div>
+          );
+        })}
+        <p style={{ color: '#444', fontSize: 11, marginTop: 14, lineHeight: 1.6 }}>
+          {data.meta.n_samples.toLocaleString()} samples · {K} clusters<br/>
+          Click a point to inspect its spectrogram.<br/>
+          Scroll to zoom · drag to pan · double-click to reset.
+        </p>
+      </div>
+    );
+  }
+
+  const pts   = data.points;
+  const lbl   = pts.ws_label_periodic[selected];
+  const lblS  = pts.ws_label[selected];
+  const sess  = pts.session_id[selected] || '__unknown__';
+  const px    = pts.x[selected].toFixed(4);
+  const py    = pts.y[selected].toFixed(4);
+  const color = TAB20[(lbl - 1) % TAB20.length];
+
+  return (
+    <div style={styles.panel}>
+      {/* Full-res spectrogram */}
+      <img
+        src={`/spec/${selected}/full`}
+        alt={`spec #${selected}`}
+        style={{ width: '100%', imageRendering: 'pixelated',
+                 border: `2px solid ${color}`, borderRadius: 3, marginBottom: 10 }}
+      />
+
+      {/* Metadata */}
+      <table style={{ fontSize: 11, color: '#aaa', borderCollapse: 'collapse', width: '100%', marginBottom: 10 }}>
+        <tbody>
+          {[
+            ['Index',   selected],
+            ['x, y',    `${px}, ${py}`],
+            ['Cluster', <><span style={{ color }}>{lbl}</span>{lbl !== lblS ? ` (std: ${lblS})` : ''}</>],
+            ['Session', sess],
+          ].map(([k, v]) => (
+            <tr key={k}>
+              <td style={{ color: '#555', paddingRight: 8, paddingBottom: 3, fontWeight: 600 }}>{k}</td>
+              <td>{v}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {/* 8-NN thumbnails */}
+      {neighbors.length > 0 && (
+        <>
+          <h4>8 nearest neighbors</h4>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 3 }}>
+            {neighbors.map(ni => (
+              <img
+                key={ni}
+                src={`/spec/${ni}/thumb`}
+                alt={`#${ni}`}
+                title={`#${ni}`}
+                onClick={() => setSelected(ni)}
+                style={{ width: '100%', aspectRatio: '1', imageRendering: 'pixelated',
+                         border: '1px solid #333', borderRadius: 2, cursor: 'pointer' }}
+              />
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Toolbar ────────────────────────────────────────────────────────────────────
+function Toolbar({ data, ui, setUi }) {
+  const sessions = useMemo(() => {
+    if (!data) return [];
+    return [...new Set(data.points.session_id.filter(Boolean))].sort();
+  }, [data]);
+
+  const K = data?.meta.n_clusters ?? 0;
+  const sizes = data?.overlays.cluster_sizes.periodic ?? {};
+
+  const toggle = (key) => setUi(u => ({ ...u, [key]: !u[key] }));
+  const set    = (key) => (e) => setUi(u => ({ ...u, [key]: e.target.value || null }));
+
+  return (
+    <div style={styles.toolbar}>
+      <span style={{ color: '#555', fontSize: 12, fontWeight: 600, letterSpacing: '0.05em' }}>
+        QLVM EXPLORER
+      </span>
+      <div style={styles.divider} />
+
+      <label><input type="checkbox" checked={ui.showHeatmap}
+        onChange={() => toggle('showHeatmap')} /> Heatmap</label>
+      <label><input type="checkbox" checked={ui.showBoundaries}
+        onChange={() => toggle('showBoundaries')} /> Boundaries</label>
+      <label><input type="checkbox" checked={ui.showPeaks}
+        onChange={() => toggle('showPeaks')} /> Peaks</label>
+
+      <div style={styles.divider} />
+
+      <select value={ui.boundaryMode}
+        onChange={e => setUi(u => ({ ...u, boundaryMode: e.target.value }))}>
+        <option value="periodic">Periodic bounds</option>
+        <option value="standard">Standard bounds</option>
+      </select>
+
+      <select value={ui.colorMode}
+        onChange={e => setUi(u => ({ ...u, colorMode: e.target.value }))}>
+        <option value="cluster_periodic">Color: cluster (periodic)</option>
+        <option value="cluster_std">Color: cluster (standard)</option>
+        <option value="none">Color: gray</option>
+      </select>
+
+      <div style={styles.divider} />
+
+      <select
+        value={ui.isolatedCluster ?? ''}
+        onChange={e => {
+          const v = e.target.value;
+          setUi(u => ({
+            ...u,
+            isolatedCluster: v === '' ? null : parseInt(v, 10),
+            tiledView: v !== '',
+          }));
+        }}
+      >
+        <option value="">All clusters</option>
+        {Array.from({ length: K }, (_, i) => {
+          const c = i + 1;
+          return (
+            <option key={c} value={c}>
+              Cluster {c} ({(sizes[c] || 0).toLocaleString()})
+            </option>
+          );
+        })}
+      </select>
+
+      <label>
+        <input type="checkbox" checked={ui.tiledView}
+          onChange={() => toggle('tiledView')} /> 3×3 tiled
+      </label>
+
+      <div style={styles.divider} />
+
+      {sessions.length > 1 && (
+        <select value={ui.sessionFilter ?? ''} onChange={set('sessionFilter')}>
+          <option value="">All sessions</option>
+          {sessions.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+      )}
+    </div>
+  );
+}
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+const styles = {
+  toolbar: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: 10,
+    padding: '7px 14px',
+    background: '#111',
+    borderBottom: '1px solid #2a2a3a',
+    alignItems: 'center',
+    flexShrink: 0,
+  },
+  divider: {
+    width: 1,
+    height: 18,
+    background: '#2a2a3a',
+  },
+  panel: {
+    width: 260,
+    overflowY: 'auto',
+    padding: 14,
+    background: '#111',
+    borderLeft: '1px solid #2a2a3a',
+    flexShrink: 0,
+  },
+  status: {
+    height: 22,
+    background: '#0a0a16',
+    borderTop: '1px solid #1e1e2e',
+    padding: '0 14px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 20,
+    fontSize: 11,
+    color: '#444',
+    flexShrink: 0,
+  },
+};
+
+// ── App ────────────────────────────────────────────────────────────────────────
+function App() {
+  const [data, setData]       = useState(null);
+  const [vp, setVp]           = useState({ cx: 0.5, cy: 0.5, zoom: 1 });
+  const [selected, setSelected] = useState(null);
+  const [hovered, setHovered]  = useState(null);
+  const [ui, setUi]            = useState({
+    showHeatmap:    true,
+    showBoundaries: true,
+    showPeaks:      true,
+    boundaryMode:   'periodic',
+    colorMode:      'cluster_periodic',
+    isolatedCluster: null,
+    tiledView:      false,
+    sessionFilter:  null,
+  });
+
+  useEffect(() => {
+    fetch('/viewer_data.json')
+      .then(r => r.json())
+      .then(d => setData(d))
+      .catch(err => console.error('Failed to load viewer_data.json:', err));
+  }, []);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key === 'Escape') { setSelected(null); }
+      if (e.key === 'r' || e.key === 'R') { setVp({ cx: 0.5, cy: 0.5, zoom: 1 }); }
+      if (e.key === 'b' || e.key === 'B') { setUi(u => ({ ...u, showBoundaries: !u.showBoundaries })); }
+      if (e.key === 'h' || e.key === 'H') { setUi(u => ({ ...u, showHeatmap: !u.showHeatmap })); }
+      if (e.key === 't' || e.key === 'T') { setUi(u => ({ ...u, tiledView: !u.tiledView })); }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
+  const wsLabel = useMemo(() => {
+    if (!data) return null;
+    return ui.colorMode === 'cluster_std'
+      ? data.points.ws_label
+      : data.points.ws_label_periodic;
+  }, [data, ui.colorMode]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
+      <Toolbar data={data} ui={ui} setUi={setUi} />
+      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+        <LatentCanvas
+          data={data} vp={vp} setVp={setVp}
+          selected={selected} setSelected={setSelected}
+          hovered={hovered}   setHovered={setHovered}
+          ui={ui}
+        />
+        <SpectrogramPanel data={data} selected={selected} setSelected={setSelected} />
+      </div>
+      <div style={styles.status}>
+        {data
+          ? `${data.meta.n_samples.toLocaleString()} pts · ${data.meta.n_clusters} clusters`
+          : 'Loading…'
+        }
+        <span>zoom {vp.zoom.toFixed(2)}×</span>
+        {selected !== null && <span>selected #{selected}</span>}
+        {hovered  !== null && wsLabel && (
+          <span>hover #{hovered} cluster {wsLabel[hovered]}</span>
+        )}
+        <span style={{ marginLeft: 'auto' }}>
+          R=reset zoom · B=boundaries · H=heatmap · T=tiled · Esc=deselect
+        </span>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

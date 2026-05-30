@@ -118,12 +118,13 @@ class QMCLVM(nn.Module):
         return self.decoder(basis)
 
 
-    def posterior_probability(self,lattice,data,log_likelihood,grid_batch_size=-1):
+    def posterior_probability(self,lattice,data,log_likelihood,c=[],grid_batch_size=-1):
         """
-        takes as input: 
+        takes as input:
             lattice (torch.Tensor): QMC lattice over the latent space
             data (torch.Tensor): data to find posterior over lattice for
             log_likelihood (function): log likelihood function used to train the model
+            c (torch.Tensor): optional conditional input, shape (1, c_dim)
         """
 
 
@@ -131,25 +132,27 @@ class QMCLVM(nn.Module):
         B = lattice.shape[0]
         if grid_batch_size == -1:
             grid_batch_size=B
-    
+
         with torch.no_grad():
             basis = self.basis(lattice % 1)
+            if len(c) > 0:
+                basis = torch.cat([basis, c.repeat(basis.shape[0], 1)], axis=-1)
 
             model_lattice_lls = []
             for batch_on in range(0,B,grid_batch_size):
                 batch_off = min(B,batch_on+grid_batch_size)
                 preds = self.decoder(basis[batch_on:batch_off])
-    
+
                 model_lattice_lls.append(log_likelihood(preds,data)) #each entry A_ij is log p(x_i|z_j)
-            model_lattice_lls =torch.cat(model_lattice_lls,axis=1) 
+            model_lattice_lls =torch.cat(model_lattice_lls,axis=1)
             ## as such, model_lattice_lls should be n_data x n_grid points
             evidence = torch.special.logsumexp(model_lattice_lls,dim=1,keepdims=True) - np.log(len(basis)) ## n_data x 1
-            
+
             posterior = model_lattice_lls - evidence
 
             return nn.Softmax(dim=1)(posterior) # posterior over grid points for each sample
     
-    def round_trip(self,grid,data,log_likelihood,recon_type='posterior',n_samples=10,grid_batch_size=-1):
+    def round_trip(self,grid,data,log_likelihood,c=[],recon_type='posterior',n_samples=10,grid_batch_size=-1):
 
         grid = grid.to(self.device)
         with torch.no_grad():
@@ -158,7 +161,7 @@ class QMCLVM(nn.Module):
 
                 for _ in range(n_samples):
                     tmp_grid = (grid + torch.rand((1,grid.shape[1]),device=self.device))%1
-                    posterior = self.posterior_probability(tmp_grid,data,log_likelihood,grid_batch_size=grid_batch_size) # Bsz x Grid size
+                    posterior = self.posterior_probability(tmp_grid,data,log_likelihood,c=c,grid_batch_size=grid_batch_size) # Bsz x Grid size
                     posterior_grid.append(self.basis.reverse(
                                             posterior.to(self.device) @ self.basis.forward(tmp_grid)
                      )) # Bsz x latent dim
@@ -168,24 +171,24 @@ class QMCLVM(nn.Module):
 
                 for _ in range(n_samples):
                     tmp_grid = (grid + torch.rand((1,grid.shape[1]),device=self.device)) % 1
-                    posterior = self.posterior_probability(tmp_grid,data,log_likelihood,grid_batch_size=grid_batch_size)
+                    posterior = self.posterior_probability(tmp_grid,data,log_likelihood,c=c,grid_batch_size=grid_batch_size)
                     recons = self.decoder(tmp_grid) # G x C x H x W (or B)
                     recons = torch.einsum('BG,GCHW->BCHW',posterior,recons)#posterior.to(self.device) @ recons
                     posterior_ims.append(recons)
                 recon = torch.stack(posterior_ims,axis=0).mean(axis=0)
 
             else:
-                posterior = self.posterior_probability(grid,data,log_likelihood,grid_batch_size=grid_batch_size)
+                posterior = self.posterior_probability(grid,data,log_likelihood,c=c,grid_batch_size=grid_batch_size)
                 posterior = posterior.to(self.device)
-            
+
             if 'argmax' in recon_type:
                 """
                 same if we do in image space vs. latent space
                 """
-                
+
                 posterior_grid = grid[torch.argmax(posterior)][None,:] % 1
-                
-                recon = self.forward(posterior_grid,random=False,mod=False)
+
+                recon = self.forward(posterior_grid,random=False,mod=False,c=c)
 
             elif ('recon' not in recon_type):
                 """
@@ -195,18 +198,18 @@ class QMCLVM(nn.Module):
                     posterior_grid = self.basis.reverse(
                                     posterior.to(self.device) @ self.basis.forward(grid % 1)
                      )
-                
+
                 elif recon_type == 'rqmc':
                     pass
                 else:
                     raise NotImplementedError
-                recon = self.forward(posterior_grid,random=False,mod=False)
+                recon = self.forward(posterior_grid,random=False,mod=False,c=c)
             else:
                 if 'posterior' in recon_type:
-                    recons = self.forward(grid,random=False,mod=True)
+                    recons = self.forward(grid,random=False,mod=True,c=c)
                     recon =  torch.einsum('BG,GCHW->BCHW',posterior,recons)
                 elif 'rqmc' in recon_type:
-                    pass 
+                    pass
                 else:
                     raise NotImplementedError
 
