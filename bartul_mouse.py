@@ -1,39 +1,119 @@
-import torch
-from models.sampling import *
-from models.qmc_base import *
-from models.layers import *
-from train.losses import binary_lp, binary_evidence
-import train.train as train_qmc
-from torch.utils.data import DataLoader
-import os
-from torch.optim import Adam
-from train.model_saving_loading import *
-from plotting.visualize import *
-from plotting.visualize_3d import model_grid_plot as model_grid_plot_3d
-from data.mouse_data import load_mouse_data, mouse_data
+"""Train a QMCLVM on mouse vocalization spectrograms.
 
+This module is a ``fire`` CLI driver. Its single entry point,
+:func:`run_mouse_experiments`, loads mouse USV spectrograms, builds a
+QMC latent-variable model (a fixed quasi-random lattice in latent space
+plus a learned ConvTranspose decoder), trains the decoder, and renders a
+suite of diagnostic plots / round-trip panels into ``save_location``.
+
+The lattice is fixed (not learned): each forward pass adds a random
+torus shift ``r ~ U[0,1]^d`` to the whole lattice. The 2D latent
+coordinates are expanded to ``(cos, sin)`` pairs by ``TorusBasis`` before
+the decoder, which is why the decoder's input width is ``2 * latent_dim``.
+
+Behavior is gated on the checkpoint file
+``<save_location>/qmc_train_mouse_experiment.tar``: if it is absent the
+model is trained (and the checkpoint + ``.npz`` diagnostics are written);
+if it is present the model is loaded and only the final plots are
+regenerated.
+
+Usage (fire CLI)::
+
+    # train (or reload) and render plots
+    python bartul_mouse.py <save_location> <dataloc> \
+        --nEpochs=300 --latent_dim=2 --lattice_type=korobov --korobov_a=76
+
+    # 3D latent space writes a multi-file grid instead of a single PNG
+    python bartul_mouse.py <save_location> <dataloc> --latent_dim=3
+
+``save_location`` and ``dataloc`` are required positional arguments; every
+other argument is an optional ``--flag=value`` (note the camelCase
+``--nEpochs`` and the ``--korobov_a`` spellings). See
+:func:`run_mouse_experiments` for the full parameter list.
+
+Star-import provenance (names used in this module):
+    * ``nn``, ``QMCLVM``, ``TorusBasis``            -> models.qmc_base
+    * ``gen_korobov_basis``, ``roberts_sequence``,
+      ``gen_fib_basis``                             -> models.sampling
+    * ``plt``, ``format_plot_axis``,
+      ``model_grid_plot``                           -> plotting.visualize
+The original wildcard imports have been made explicit below.
+"""
+
+# --- standard library ---
 import json
+import os
 import random
-import numpy as np
+
+# --- third-party ---
 import fire
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# --- local: models / training ---
+from models.qmc_base import QMCLVM, TorusBasis
+from models.sampling import gen_fib_basis, gen_korobov_basis, roberts_sequence
+from train.losses import binary_lp, binary_evidence
+from train.model_saving_loading import load, save
+import train.train as train_qmc
 
-def print_gpu_memory(label=""):
+# --- local: data / plotting ---
+from data.mouse_data import load_mouse_data, mouse_data
+from plotting.visualize import format_plot_axis, model_grid_plot, plt
+from plotting.visualize_3d import model_grid_plot as model_grid_plot_3d
+
+
+# ---------------------------------------------------------------------------
+# GPU memory reporting
+# ---------------------------------------------------------------------------
+def print_gpu_memory(label="", compact=False):
+    """Print current CUDA memory usage (allocated / reserved / peak).
+
+    Single source of truth for the two GPU-memory print formats used in
+    this module:
+
+    * ``compact=False`` (default) -- full milestone report including the
+      device total, e.g. ``[GPU <label>] allocated=...MB ... total=...MB``.
+      Used at named milestones (model init, after training, after load).
+    * ``compact=True`` -- the indented per-epoch line (two leading spaces,
+      no device total), e.g. ``  [GPU <label>] allocated=...MB ... peak=...MB``.
+
+    Both branches are reproduced byte-for-byte from the original inline
+    prints. When CUDA is unavailable, the full format prints a "no CUDA
+    device available" message; the compact (per-epoch) caller is guarded by
+    its own ``torch.cuda.is_available()`` check and is never reached without
+    a device.
+    """
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**2
         reserved = torch.cuda.memory_reserved() / 1024**2
         peak = torch.cuda.max_memory_allocated() / 1024**2
-        total = torch.cuda.get_device_properties(0).total_memory / 1024**2
-        print(
-            f"[GPU {label}] allocated={allocated:.1f}MB  reserved={reserved:.1f}MB  peak={peak:.1f}MB  total={total:.1f}MB"
-        )
+        if compact:
+            print(f"  [GPU {label}] allocated={allocated:.1f}MB  reserved={reserved:.1f}MB  peak={peak:.1f}MB")
+        else:
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**2
+            print(
+                f"[GPU {label}] allocated={allocated:.1f}MB  reserved={reserved:.1f}MB  peak={peak:.1f}MB  total={total:.1f}MB"
+            )
     else:
         print(f"[GPU {label}] no CUDA device available")
 
 
+# ---------------------------------------------------------------------------
+# Validation diagnostics: reconstruction MSE over a fixed val subset
+# ---------------------------------------------------------------------------
 def compute_val_diagnostics(model, val_dataset, base_sequence, lp_fnc, device, indices, diag_batch_size=32):
     """Compute reconstruction MSE for a fixed set of val indices.
+
+    Each spectrogram in ``indices`` is round-tripped through the model
+    (lattice posterior -> decoder) and compared to the original; the
+    per-sample mean-squared error is collected. The model is switched to
+    ``eval()`` for the pass and back to ``train()`` afterwards so the caller
+    can keep training.
 
     indices: pre-computed array of dataset indices (balanced across masks_len bins).
     Returns mse_arr (float32 numpy array of length len(indices)).
@@ -53,11 +133,21 @@ def compute_val_diagnostics(model, val_dataset, base_sequence, lp_fnc, device, i
     return np.array(all_mse, dtype=np.float32)
 
 
+# ---------------------------------------------------------------------------
+# Diagnostic plotting (loss curve + MSE breakdowns) and round-trip panels
+# ---------------------------------------------------------------------------
 def _save_diagnostic_plots(
     save_location, qmc_losses, val_loss_epochs, val_losses,
     diag_epochs, diag_mse, val_diag_ml, val_diag_dur, dur_bin_edges,
 ):
-    """Write all three diagnostic plots to save_location, overwriting any existing files."""
+    """Write all three diagnostic plots to save_location, overwriting any existing files.
+
+    Plots: (1) train/val log-evidence over update number
+    (``qmc_train_stats.png``); (2) mean val MSE per ``masks_len`` group over
+    epochs (``qmc_val_mse_by_masks_len.png``); (3) mean val MSE per duration
+    bin over epochs (``qmc_val_mse_by_duration.png``). The MSE plots are
+    skipped until at least one diagnostic checkpoint exists.
+    """
     # --- loss plot ---
     fig, ax = plt.subplots()
     ax.plot(-np.array(qmc_losses), label="train", alpha=0.8, color="tab:blue")
@@ -189,6 +279,66 @@ def _save_round_trip_panel(dataset, model, base_sequence, lp_fnc, device, save_p
     model.train()
 
 
+# ---------------------------------------------------------------------------
+# Model + lattice construction
+# ---------------------------------------------------------------------------
+def build_qmc_decoder(latent_dim):
+    """Build the ConvTranspose2d decoder for the QMCLVM.
+
+    The input width is ``2 * latent_dim`` because ``TorusBasis`` expands each
+    latent coordinate ``z`` to a ``(cos(2*pi*z), sin(2*pi*z))`` pair before
+    decoding. The body is two linear layers up to a 64x8x8 feature map
+    followed by four ConvTranspose2d blocks (64 -> 32 -> 16 -> 8 -> 1, each
+    stride-2 upsampling) and a final Sigmoid so outputs lie in [0, 1].
+    """
+    return nn.Sequential(
+        nn.Linear(2 * latent_dim, 2048),
+        nn.Linear(2048, 64 * 8 * 8),
+        nn.Unflatten(1, (64, 8, 8)),
+        nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
+        nn.ReLU(),
+        nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
+        nn.ReLU(),
+        nn.ConvTranspose2d(16, 8, 3, stride=2, padding=1, output_padding=1),
+        nn.ReLU(),
+        nn.ConvTranspose2d(8, 1, 3, stride=2, padding=1, output_padding=1),
+        nn.Sigmoid(),
+    )
+
+
+def build_lattice_pair(
+    lattice_type, latent_dim,
+    korobov_a, train_n_points, test_n_points,
+    train_grid_m, test_grid_m,
+):
+    """Return ``(train_base_sequence, test_base_sequence)`` lattices.
+
+    Selects the QMC generator by ``lattice_type``:
+
+    * ``"korobov"`` -- Korobov lattice ``gen_korobov_basis(a, dim, n_points)``.
+    * ``"roberts"`` -- Roberts low-discrepancy sequence ``roberts_sequence(n_points, dim)``.
+    * anything else -- Fibonacci lattice ``gen_fib_basis(m=grid_m)`` (2D only).
+
+    Note the differing per-generator argument order, reproduced exactly from
+    the original inline construction.
+    """
+    if lattice_type == "korobov":
+        train_base_sequence = gen_korobov_basis(
+            korobov_a, latent_dim, train_n_points
+        )
+        test_base_sequence = gen_korobov_basis(korobov_a, latent_dim, test_n_points)
+    elif lattice_type == "roberts":
+        train_base_sequence = roberts_sequence(train_n_points, latent_dim)
+        test_base_sequence = roberts_sequence(test_n_points, latent_dim)
+    else:  # 'fib', 2D only
+        train_base_sequence = gen_fib_basis(m=train_grid_m)
+        test_base_sequence = gen_fib_basis(m=test_grid_m)
+    return train_base_sequence, test_base_sequence
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 def run_mouse_experiments(
     save_location,
     dataloc,
@@ -218,6 +368,55 @@ def run_mouse_experiments(
     total_samples=None,
     duration_aware=False,
 ):
+    """Train (or reload) a QMCLVM on mouse spectrograms and render diagnostics.
+
+    Required positional args:
+        save_location: output directory for the checkpoint, ``.npz``
+            diagnostics, ``sampling_config.json`` and all plots (created if
+            missing). Re-running with an existing
+            ``qmc_train_mouse_experiment.tar`` here skips training and only
+            regenerates the final plots.
+        dataloc: path passed to ``load_mouse_data`` (train/val split source).
+
+    Lattice / model args:
+        train_grid_m, test_grid_m: Fibonacci lattice order (used only when
+            ``lattice_type`` is neither korobov nor roberts; 2D only).
+        latent_dim: latent dimensionality (decoder input is ``2*latent_dim``
+            via TorusBasis). ``latent_dim=3`` writes a multi-file grid instead
+            of a single ``qmc_grid.png``.
+        lattice_type: "korobov" | "roberts" | other (-> Fibonacci).
+        korobov_a: Korobov generating integer (only used for korobov lattices).
+        train_n_points, test_n_points: lattice sizes for korobov/roberts.
+        nEpochs: number of training epochs.
+
+    Training / data args:
+        samples_per_mask, total_samples, duration_aware, sampling_strategy,
+        filter_mask, lo, hi: forwarded to ``mouse_data`` for the train set.
+        train_batch_size, test_batch_size, num_workers: DataLoader settings
+            (``num_workers`` defaults to the CPU affinity count).
+        print_gpu_mem: if True, print a compact per-epoch GPU-memory line.
+
+    Diagnostics args:
+        val_freq: run val loss + MSE diagnostics every ``val_freq`` epochs
+            (and on the final epoch). Round-trip panels are written on a fixed
+            cadence of every 40 epochs.
+        test_samples_per_mask: cap on val samples drawn per ``masks_len`` bin
+            for the diagnostic subset.
+        n_dur_bins: number of duration percentile bins for the MSE-by-duration plot.
+
+    Seeding args:
+        seed: dataset / round-trip RNG seed (``mouse_data`` uses ``seed``).
+        model_seed: global RNG seed for model init; defaults to ``seed``.
+
+    Side effects (artifacts written to ``save_location``):
+        sampling_config.json, qmc_train_mouse_experiment.tar,
+        qmc_val_diagnostics.npz, qmc_train_stats.png, qmc_train_stats.svg,
+        qmc_val_mse_by_masks_len.png, qmc_val_mse_by_duration.png,
+        qmc_round_trips_val_<epoch>.png, qmc_round_trips_train.png,
+        qmc_round_trips_val.png, and qmc_grid.png (or a multi-file qmc_grid
+        directory when ``latent_dim == 3``).
+    """
+    # --- seeding: model_seed governs model init RNG; mouse_data uses `seed` ---
     if model_seed is None:
         model_seed = seed
     random.seed(model_seed)
@@ -225,6 +424,7 @@ def run_mouse_experiments(
     torch.manual_seed(model_seed)
     torch.cuda.manual_seed_all(model_seed)
 
+    # --- data loading: build train/val mouse_data datasets and loaders ---
     if not os.path.exists(save_location):
         print(f"Creating save directory: {save_location}")
         os.makedirs(save_location)
@@ -256,23 +456,12 @@ def run_mouse_experiments(
     print(f"Device: {device}")
     print_gpu_memory("before model init")
 
+    # --- model + losses: binary evidence for training, binary lp for round-trips ---
     qmc_latent_dim = latent_dim
     qmc_loss_function = lambda samples, data: binary_evidence(samples, data)
     lp_fnc = lambda x, y: binary_lp(x, y)
 
-    decoder_qmc = nn.Sequential(
-        nn.Linear(2 * qmc_latent_dim, 2048),
-        nn.Linear(2048, 64 * 8 * 8),
-        nn.Unflatten(1, (64, 8, 8)),
-        nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(16, 8, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(8, 1, 3, stride=2, padding=1, output_padding=1),
-        nn.Sigmoid(),
-    )
+    decoder_qmc = build_qmc_decoder(qmc_latent_dim)
 
     qmc_model = QMCLVM(
         latent_dim=qmc_latent_dim,
@@ -281,17 +470,11 @@ def run_mouse_experiments(
         basis=TorusBasis(),
     )
     print_gpu_memory("after model init")
-    if lattice_type == "korobov":
-        train_base_sequence = gen_korobov_basis(
-            korobov_a, qmc_latent_dim, train_n_points
-        )
-        test_base_sequence = gen_korobov_basis(korobov_a, qmc_latent_dim, test_n_points)
-    elif lattice_type == "roberts":
-        train_base_sequence = roberts_sequence(train_n_points, qmc_latent_dim)
-        test_base_sequence = roberts_sequence(test_n_points, qmc_latent_dim)
-    else:  # 'fib', 2D only
-        train_base_sequence = gen_fib_basis(m=train_grid_m)
-        test_base_sequence = gen_fib_basis(m=test_grid_m)
+    train_base_sequence, test_base_sequence = build_lattice_pair(
+        lattice_type, qmc_latent_dim,
+        korobov_a, train_n_points, test_n_points,
+        train_grid_m, test_grid_m,
+    )
 
     save_qmc  = os.path.join(save_location, "qmc_train_mouse_experiment.tar")
     save_diag = os.path.join(save_location, "qmc_val_diagnostics.npz")
@@ -325,6 +508,7 @@ def run_mouse_experiments(
     # pre-compute fixed indices for per-epoch round-trip panels
     round_trip_val_indices = precompute_round_trip_indices(test_loader.dataset, n_per_mask=10, seed=seed)
 
+    # --- train-vs-load gate: presence of the .tar checkpoint decides ---
     if not os.path.isfile(save_qmc):
         print("now training qmc model")
         torch.cuda.reset_peak_memory_stats()
@@ -364,6 +548,7 @@ def run_mouse_experiments(
                     diag_epochs, diag_mse, val_diag_ml, val_diag_dur, dur_bin_edges,
                 )
 
+            # round-trip panels on a fixed cadence of every 40 epochs
             if (epoch + 1) % 40 == 0:
                 _save_round_trip_panel(
                     test_loader.dataset, qmc_model,
@@ -373,10 +558,7 @@ def run_mouse_experiments(
                 )
 
             if print_gpu_mem and torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated() / 1024**2
-                reserved  = torch.cuda.memory_reserved()  / 1024**2
-                peak      = torch.cuda.max_memory_allocated() / 1024**2
-                print(f"  [GPU epoch {epoch+1}] allocated={allocated:.1f}MB  reserved={reserved:.1f}MB  peak={peak:.1f}MB")
+                print_gpu_memory(f"epoch {epoch+1}", compact=True)
 
         print_gpu_memory("after training")
         save(qmc_model.to("cpu"), qmc_opt, qmc_losses, fn=save_qmc)
@@ -396,6 +578,7 @@ def run_mouse_experiments(
         qmc_model, qmc_opt, qmc_losses = load(qmc_model, qmc_opt, save_qmc)
         print_gpu_memory("after model load")
 
+    # --- final plots: SVG loss curve, latent grid, and train/val round-trips ---
     qmc_losses = np.array(qmc_losses)
     ax = plt.gca()
     ax.plot(-qmc_losses)
@@ -409,6 +592,8 @@ def run_mouse_experiments(
     plt.savefig(os.path.join(save_location, "qmc_train_stats.svg"))
     plt.close()
 
+    # 3D latent: use the 3D grid plotter writing a multi-file "qmc_grid" set;
+    # otherwise a single "qmc_grid.png".
     _grid_plot_fn = model_grid_plot_3d if qmc_latent_dim == 3 else model_grid_plot
     _grid_fn = os.path.join(save_location, "qmc_grid") if qmc_latent_dim == 3 else os.path.join(save_location, "qmc_grid.png")
     _grid_plot_fn(

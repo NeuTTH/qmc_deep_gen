@@ -1,28 +1,43 @@
 """
 inference_latents_video.py — Two-panel traversal video over the QMC latent torus.
 
+A ``fire``-driven matplotlib ``FuncAnimation`` builder that renders a guided
+"torus walkthrough" video from the outputs of ``inference_latents.py``. The
+single entry point is :func:`make_traversal_video`, exposed as a CLI via
+``fire.Fire``. It reconstructs the exact ``mouse_data`` dataset used at
+inference time (so latent index ``i`` lines up with dataset sample ``i``),
+builds a ball-tree nearest-neighbour index over the torus embedding, assembles
+an ordered list of animation "phases", precomputes per-traversal reveal/inset
+positions, then animates the two panels frame by frame and writes the result to
+an ``.mp4`` (``FFMpegWriter``) or ``.gif`` (``PillowWriter``).
+
 Consumes outputs of inference_latents.py:
     arrays.npz                       (latent_coords, heatmap, ws_labels_periodic, centers, ...)
     latents_full_provenance.json     (data-loading parameters)
 
 Layout:
-  left  = [0,1]² latent map (heatmap + watershed contours) with
-          spectrogram overlays (during traversals) along the active
-          trajectory.
-  right = phase-specific spectrogram panel — ring (Part 1) / 5×10 grid
-          (Parts 2 & 3) / 2×5 magnified grid (Part 4).
+  left  = [0,1]² latent map (heatmap + watershed contours) with a red path
+          trail and spectrogram thumbnails (during traversals) placed along
+          the active trajectory.
+  right = phase-specific spectrogram panel — a concentric ring of tiles
+          (Part 1) or a 5×15 = 75-slot grid (Parts 2 & 3).
 
-Phases:
-  • Part 1 — Cluster peaks. For each cluster i, the right panel shows the
-    peak surrounded by `m` nearest samples in a ring. The active cluster's
-    region is outlined on the left panel with a cyan contour.
-  • Part 2 — Peak-to-peak walks (5). Shortest torus path + small smooth
-    jitter. Right panel is a 5×10 grid filling progressively with 50 NN
-    spectrograms.
-  • Part 3 — Boundary crossings (5). Deterministic half-sine curved walks
-    that wrap edges. 20 inset spectrograms appear along the trajectory on
-    the left (cleared per walk). Right panel is a 5×20 grid: columns =
-    trajectory positions, rows = each position's 5 nearest neighbors.
+Phases (each preceded by a full-figure white title card):
+  • Part 1 — Cluster peaks. For each cluster i, the right ring shows the peak
+    (center tile) surrounded by its `m` nearest samples laid out in up to three
+    concentric rings (inner ≤6, middle ≤12, outer ≤18; with the default m=36
+    this fills all three). The active cluster's region is outlined on the left
+    panel with a cyan contour.
+  • Part 2 — Peak-to-peak walks (up to 5). Shortest torus path + small smooth
+    jitter between random cluster peaks. The right 5×15 grid fills row-major
+    with up to `samples_per_trace` (default 75) single-nearest-neighbour
+    spectrograms, one per revealed trajectory position.
+  • Part 3 — Boundary crossings (5). Deterministic half-sine curved walks that
+    wrap edges/corners of the torus. `boundary_positions_per_walk` (default 15)
+    inset spectrograms appear along the trajectory on the left (cleared per
+    walk). The right 5×15 grid uses columns = `boundary_positions_per_walk`
+    trajectory positions and rows = `boundary_neighbors` (default 5) nearest
+    neighbours per column.
 
 Usage:
     python inference_latents_video.py \
@@ -31,10 +46,12 @@ Usage:
         --output_path=path/to/out.mp4
 """
 
+# ── Standard library ───────────────────────────────────────────────────────
 import json
 import os
 from functools import lru_cache
 
+# ── Third-party ────────────────────────────────────────────────────────────
 import fire
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -46,11 +63,18 @@ from matplotlib.offsetbox import AnnotationBbox, OffsetImage
 from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
+# ── Local (qmc_deep_gen) ───────────────────────────────────────────────────
 from analysis.model_helpers import torus_forward
 from data.mouse_data import mouse_data
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Geometry / trajectory helpers (pure, no matplotlib state)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
 def _lin(a, b, n):
+    """Linear interpolation a → b in `n` steps, returning an (n, len(a)) array."""
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     return a + np.linspace(0.0, 1.0, n)[:, None] * (b - a)
@@ -112,7 +136,13 @@ def _wrapped_segments(traj_unit, wrap_thresh=0.5):
     return segs
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Matplotlib artist helpers (mutate / create axes & inset artists)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
 def _set_border(ax, color, width):
+    """Set every spine of `ax` to the given color/width (used for tile borders)."""
     for sp in ax.spines.values():
         sp.set_visible(True)
         sp.set_edgecolor(color)
@@ -162,98 +192,32 @@ def _move_inset(ab, x, y):
     ab.xybox = pt
 
 
-def make_traversal_video(
-    inference_dir: str,
-    dataloc: str,
-    output_path: str = None,
-    m: int = 36,
-    fps: int = 23,
-    cluster_hold_frames: int = 60,
-    peak_traverse_frames: int = 200,
-    boundary_traverse_frames: int = 200,
-    title_card_frames: int = 45,
-    samples_per_trace: int = 75,
-    peak_jitter_sigma: float = 0.015,
-    boundary_curve_amplitude: float = 0.18,
-    boundary_positions_per_walk: int = 15,
-    boundary_neighbors: int = 5,
-    traj_inset_zoom: float = 0.15,
-    seed: int = 0,
-    dpi: int = 100,
-    spec_cache_size: int = 2048,
-    peaks_only: bool = False,
-):
-    """Render the traversal video.
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase-list construction (pure: builds the ordered animation script)
+# ═══════════════════════════════════════════════════════════════════════════
 
-    Args:
-        inference_dir: directory with arrays.npz + provenance JSON.
-        dataloc: directory holding full_data.pt (same as used at inference time).
-        output_path: defaults to inference_dir/traversal_video.mp4.
-        m: ring-neighbor count for cluster deep-dive panels (peak + m around it).
-        fps: frames per second of the output video.
-        cluster_hold_frames: dwell length for each cluster deep-dive.
-        peak_traverse_frames: frames per peak→peak walk (5 total).
-        boundary_traverse_frames: frames per boundary-crossing walk (5 total).
-        title_card_frames: dwell length for each big white interstitial card.
-        samples_per_trace: spectrograms revealed during a peak→peak traversal
-            (row-major fill of the 5×20 right grid).
-        peak_jitter_sigma: amplitude of the small smooth jitter added to the
-            straight peak-to-peak path; small ⇒ walk hugs the geodesic.
-        boundary_curve_amplitude: half-sine bend (perpendicular to the straight
-            line) used for boundary-crossing walks; sign flips per-walk.
-        boundary_positions_per_walk: trajectory sample positions per boundary
-            walk (= columns of the right grid in Part 3, = inset spectrograms
-            placed on the left panel along the curve).
-        boundary_neighbors: rows of the right grid in Part 3 — how many NN
-            per trajectory position to display.
-        traj_inset_zoom: zoom factor for OffsetImage thumbnails placed along
-            boundary trajectories.
-        seed: RNG seed for jitter + peak-pair sampling.
-        spec_cache_size: LRU cache size for spectrogram disk reads.
-        peaks_only: if True, render only Part 1 (cluster peaks) and exit.
+
+def build_phases(centers, K, peaks_only, title_card_frames, cluster_hold_frames,
+                 peak_traverse_frames, boundary_traverse_frames,
+                 peak_jitter_sigma, boundary_curve_amplitude, rng):
+    """Build the ordered list of animation phases (the "script").
+
+    The returned list mixes ``title_card`` / ``cluster`` / ``traversal`` phase
+    dicts in a load-bearing append order:
+
+      1. Part 1 title card, then one ``cluster`` phase per cluster.
+      2. (unless `peaks_only`) Part 2 title card, then up to 5 peak→peak
+         ``traversal`` phases.
+      3. (unless `peaks_only`) Part 3 title card, then the 5 hardcoded
+         boundary-crossing ``traversal`` phases.
+
+    `rng` is consumed in a fixed order — first ``rng.choice`` for the peak-pair
+    selection, then per-pair :func:`_smooth_jitter` draws in pair order — so the
+    *same* ``np.random.Generator`` instance must be passed in (never re-seeded
+    here). When `peaks_only` is True the Part 2/3 block is skipped entirely and
+    `rng` is never drawn from.
     """
-    # ── Inputs ──────────────────────────────────────────────────────────
-    arr = np.load(os.path.join(inference_dir, 'arrays.npz'))
-    latent_coords = arr['latent_coords']
-    heatmap = arr['heatmap']
-    ws_labels = arr['ws_labels_periodic']
-    centers = arr['centers']
-    res = heatmap.shape[0]
-    K = len(centers)
-    print(f'Loaded {len(latent_coords)} latents, {K} clusters from {inference_dir}')
-
-    with open(os.path.join(inference_dir, 'latents_full_provenance.json')) as f:
-        prov = json.load(f)
-    pp = prov['parameters']
-
-    if output_path is None:
-        output_path = os.path.join(inference_dir, 'traversal_video.mp4')
-
-    full_dict = torch.load(os.path.join(dataloc, 'full_data.pt'), mmap=True)
-    full_ds = mouse_data(
-        full_dict, filter_mask=pp['filter_mask'], lo=pp['lo'], hi=pp['hi'],
-        sampling_strategy='subsample', total_samples=pp.get('total_samples'),
-    )
-    assert len(full_ds) == len(latent_coords), (
-        f'dataset size {len(full_ds)} != latent count {len(latent_coords)}'
-    )
-
-    # ── NN index ────────────────────────────────────────────────────────
-    print('Building torus NN index...')
-    nn_index = NearestNeighbors(n_neighbors=max(m + 1, boundary_neighbors, 1),
-                                  algorithm='ball_tree').fit(torus_forward(latent_coords))
-
-    def nn_query(xy_unit, k):
-        z = torus_forward(np.asarray(xy_unit)[None])
-        _, idx = nn_index.kneighbors(z, n_neighbors=k)
-        return idx[0]
-
-    # m+1 neighbors per cluster: index 0 = peak (center tile), 1..m = ring
-    cluster_nn = [nn_query(c, k=m + 1) for c in centers]              # (K, m+1)
-
-    # ── Build phase list ────────────────────────────────────────────────
     phases = []
-    rng = np.random.default_rng(seed)
 
     # Part 1 — Cluster peaks
     phases.append({
@@ -317,12 +281,34 @@ def make_traversal_video(
                 'duration': boundary_traverse_frames,
             })
 
-    # ── Pre-compute reveal positions and NN per traversal ───────────────
-    # Each traversal stores:
-    #   reveal_frames/xy/(idx|nn) — drive the right-panel grid fill.
-    #   inset_frames/xy/idx       — drive the left-panel inset spectrograms.
-    # For boundary walks the two coincide. For peak walks insets are a
-    # subsample (boundary_positions_per_walk) of the 60 grid reveals.
+    return phases
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Per-traversal reveal/inset precompute (pure apart from `nn_query` reads)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def precompute_reveals(phases, nn_query, samples_per_trace,
+                       boundary_positions_per_walk, boundary_neighbors):
+    """Annotate each ``traversal`` phase in-place with its reveal / inset plan.
+
+    For every traversal phase this writes the keys consumed by the per-frame
+    ``update`` closure:
+
+      • ``reveal_frames`` / ``reveal_xy`` and either ``reveal_nn`` (boundary) or
+        ``reveal_idx`` (peak) — drive the right-panel grid fill.
+      • ``inset_frames`` / ``inset_xy`` / ``inset_idx`` — drive the left-panel
+        inset spectrograms.
+
+    Boundary walks reveal `boundary_positions_per_walk` evenly-spaced
+    trajectory positions, each with its `boundary_neighbors` nearest neighbours
+    (the insets reuse those positions, taking the single closest NN). Peak walks
+    reveal `samples_per_trace` positions with one NN each; their insets are a
+    ``min(boundary_positions_per_walk, samples_per_trace)`` subsample of the
+    trajectory. The ``% 1.0`` wrapping keeps off-grid endpoints on the torus and
+    the ``.astype(int)`` truncation of the linspace is intentional.
+    """
     for ph in phases:
         if ph['name'] != 'traversal':
             continue
@@ -354,7 +340,120 @@ def make_traversal_video(
             ph['inset_xy'] = inset_xy
             ph['inset_idx'] = inset_idx
 
-    # Flatten phases → per-frame info
+
+def make_traversal_video(
+    inference_dir: str,
+    dataloc: str,
+    output_path: str = None,
+    m: int = 36,
+    fps: int = 23,
+    cluster_hold_frames: int = 60,
+    peak_traverse_frames: int = 200,
+    boundary_traverse_frames: int = 200,
+    title_card_frames: int = 45,
+    samples_per_trace: int = 75,
+    peak_jitter_sigma: float = 0.015,
+    boundary_curve_amplitude: float = 0.18,
+    boundary_positions_per_walk: int = 15,
+    boundary_neighbors: int = 5,
+    traj_inset_zoom: float = 0.15,
+    seed: int = 0,
+    dpi: int = 100,
+    spec_cache_size: int = 2048,
+    peaks_only: bool = False,
+):
+    """Render the traversal video.
+
+    Args:
+        inference_dir: directory with arrays.npz + provenance JSON.
+        dataloc: directory holding full_data.pt (same as used at inference time).
+        output_path: defaults to inference_dir/traversal_video.mp4.
+        m: ring-neighbor count for cluster deep-dive panels (peak + m around it).
+        fps: frames per second of the output video.
+        cluster_hold_frames: dwell length for each cluster deep-dive.
+        peak_traverse_frames: frames per peak→peak walk (5 total).
+        boundary_traverse_frames: frames per boundary-crossing walk (5 total).
+        title_card_frames: dwell length for each big white interstitial card.
+        samples_per_trace: spectrograms revealed during a peak→peak traversal
+            (row-major fill of the 5×15 right grid).
+        peak_jitter_sigma: amplitude of the small smooth jitter added to the
+            straight peak-to-peak path; small ⇒ walk hugs the geodesic.
+        boundary_curve_amplitude: half-sine bend (perpendicular to the straight
+            line) used for boundary-crossing walks; sign flips per-walk.
+        boundary_positions_per_walk: trajectory sample positions per boundary
+            walk (= columns of the right grid in Part 3, = inset spectrograms
+            placed on the left panel along the curve).
+        boundary_neighbors: rows of the right grid in Part 3 — how many NN
+            per trajectory position to display.
+        traj_inset_zoom: zoom factor for OffsetImage thumbnails placed along
+            boundary trajectories.
+        seed: RNG seed for jitter + peak-pair sampling.
+        spec_cache_size: LRU cache size for spectrogram disk reads.
+        peaks_only: if True, render only Part 1 (cluster peaks) and exit.
+    """
+    # ── Inputs ──────────────────────────────────────────────────────────
+    arr = np.load(os.path.join(inference_dir, 'arrays.npz'))
+    latent_coords = arr['latent_coords']
+    heatmap = arr['heatmap']
+    ws_labels = arr['ws_labels_periodic']
+    centers = arr['centers']
+    res = heatmap.shape[0]
+    K = len(centers)
+    print(f'Loaded {len(latent_coords)} latents, {K} clusters from {inference_dir}')
+
+    with open(os.path.join(inference_dir, 'latents_full_provenance.json')) as f:
+        prov = json.load(f)
+    pp = prov['parameters']
+
+    if output_path is None:
+        output_path = os.path.join(inference_dir, 'traversal_video.mp4')
+
+    full_dict = torch.load(os.path.join(dataloc, 'full_data.pt'), mmap=True)
+    full_ds = mouse_data(
+        full_dict, filter_mask=pp['filter_mask'], lo=pp['lo'], hi=pp['hi'],
+        sampling_strategy='subsample', total_samples=pp.get('total_samples'),
+    )
+    assert len(full_ds) == len(latent_coords), (
+        f'dataset size {len(full_ds)} != latent count {len(latent_coords)}'
+    )
+
+    # ── NN index ────────────────────────────────────────────────────────
+    print('Building torus NN index...')
+    nn_index = NearestNeighbors(n_neighbors=max(m + 1, boundary_neighbors, 1),
+                                  algorithm='ball_tree').fit(torus_forward(latent_coords))
+
+    def nn_query(xy_unit, k):
+        """Return the k nearest latent indices to a single [0,1]² point.
+
+        The point is lifted to the torus embedding (the ``[None]`` keeps the
+        input 2D as ``torus_forward`` requires) before querying the ball tree.
+        """
+        z = torus_forward(np.asarray(xy_unit)[None])
+        _, idx = nn_index.kneighbors(z, n_neighbors=k)
+        return idx[0]
+
+    # m+1 neighbors per cluster: index 0 = peak (center tile), 1..m = ring
+    cluster_nn = [nn_query(c, k=m + 1) for c in centers]              # (K, m+1)
+
+    # ── Phase-list build ────────────────────────────────────────────────
+    # `rng` is created ONCE here and threaded into build_phases so its draw
+    # order (peak-pair choice, then per-pair jitter) is fixed and reproducible.
+    rng = np.random.default_rng(seed)
+    phases = build_phases(
+        centers, K, peaks_only, title_card_frames, cluster_hold_frames,
+        peak_traverse_frames, boundary_traverse_frames,
+        peak_jitter_sigma, boundary_curve_amplitude, rng,
+    )
+
+    # ── Per-traversal precompute (reveal positions + NN) ────────────────
+    # Annotates each traversal phase in-place with the reveal/inset plan that
+    # drives the right-panel grid fill and the left-panel inset spectrograms.
+    precompute_reveals(
+        phases, nn_query, samples_per_trace,
+        boundary_positions_per_walk, boundary_neighbors,
+    )
+
+    # ── Flatten phases → per-frame info ─────────────────────────────────
     frames_info = []
     for pi, ph in enumerate(phases):
         for fi in range(ph['duration']):
@@ -370,10 +469,12 @@ def make_traversal_video(
     sample_spec = full_ds[0][0].numpy().squeeze()
     spec_H, spec_W = sample_spec.shape
 
-    # Traversal grid: 4 rows × 15 cols = 60 slots
-    #   • Peak→peak (Part 2): up to 60 reveals, row-major fill, one NN per slot.
-    #   • Boundary (Part 3):  cols = 15 trajectory positions,
-    #                          rows = 4 nearest neighbors per column.
+    # Traversal grid: 5 rows × 15 cols = 75 slots
+    #   • Peak→peak (Part 2): up to samples_per_trace reveals, row-major fill,
+    #                          one NN per slot.
+    #   • Boundary (Part 3):  cols = boundary_positions_per_walk (15) trajectory
+    #                          positions, rows = boundary_neighbors (5) nearest
+    #                          neighbors per column.
     grid_nrows = 5
     grid_ncols = 15
     n_grid_slots = grid_nrows * grid_ncols
@@ -471,10 +572,15 @@ def make_traversal_video(
     ax_l.set_xlabel('QLVM dim 1')
     ax_l.set_ylabel('QLVM dim 2')
 
-    cluster_contours = {}
+    cluster_contours = {}        # cluster index → cached cyan QuadContourSet
     active_contour_ci = {'value': None}
 
     def show_cluster_contour(ci):
+        """Show cluster `ci`'s cyan outline on the left panel, hiding any prior.
+
+        Lazily builds and caches the contour the first time a cluster is shown;
+        mutates ``cluster_contours`` and ``active_contour_ci`` shared state.
+        """
         prev = active_contour_ci['value']
         if prev is not None and prev != ci and prev in cluster_contours:
             _contour_visible(cluster_contours[prev], False)
@@ -487,12 +593,13 @@ def make_traversal_video(
         active_contour_ci['value'] = ci
 
     def hide_active_contour():
+        """Hide the currently-active cluster contour (if any) on the left panel."""
         prev = active_contour_ci['value']
         if prev is not None and prev in cluster_contours:
             _contour_visible(cluster_contours[prev], False)
         active_contour_ci['value'] = None
 
-    # Dynamic left-panel artists
+    # ── Dynamic left-panel artists ─────────────────────────────────────
     # zorder=6 keeps the trail under inset spectrograms (zorder=10/11).
     trail_lc = LineCollection([], colors='red', linewidths=1.9,
                                alpha=0.9, zorder=6)
@@ -504,6 +611,7 @@ def make_traversal_video(
 
     @lru_cache(maxsize=spec_cache_size)
     def _get_spec(data_idx):
+        """Read (and LRU-cache) the spectrogram for a dataset index from disk."""
         return full_ds[int(data_idx)][0].numpy().squeeze()
 
     # ── Trajectory insets (pool reused for peak + boundary walks) ──────
@@ -519,11 +627,13 @@ def make_traversal_video(
         traj_insets.append((oi, ab))
 
     def hide_traj_insets():
+        """Hide every pooled trajectory-inset AnnotationBbox on the left panel."""
         for _, ab in traj_insets:
             ab.set_visible(False)
 
-    # ── Tile init helpers (right panel grids) ──────────────────────────
+    # ── Tile helpers (right-panel grid + ring) ─────────────────────────
     def _init_tile(ax, fontsize):
+        """Initialise one tile axes: blank imshow + empty title; return (im, t)."""
         ax.set_xticks([]); ax.set_yticks([])
         _set_border(ax, 'lightgray', 0.5)
         im = ax.imshow(np.zeros((spec_H, spec_W)), cmap='inferno',
@@ -544,6 +654,12 @@ def make_traversal_video(
     BLANK = np.zeros((spec_H, spec_W))
 
     def _draw(im, ax, t, data_idx, title_str, border, border_w):
+        """Paint one tile: spectrogram (or blank) + per-tile clim + title + border.
+
+        Mutates the passed image/title/axes artists in place. ``data_idx=None``
+        blanks the tile (clim 0..1); otherwise the spectrogram is normalised to
+        its own max (floored at 1e-8 to avoid a degenerate clim).
+        """
         if data_idx is None:
             im.set_data(BLANK); im.set_clim(0, 1)
         else:
@@ -556,27 +672,33 @@ def make_traversal_video(
 
     def render_grid_slot(slot, data_idx, title_str='',
                          border='lightgray', border_w=0.5):
+        """Draw spectrogram `data_idx` into right-grid tile `slot` (in place)."""
         _draw(grid_imgs[slot], ax_grid[slot], grid_titles[slot],
               data_idx, title_str, border, border_w)
 
     def render_ring_slot(slot, data_idx, title_str='',
                          border='lightgray', border_w=0.5):
+        """Draw spectrogram `data_idx` into ring tile `slot` (in place)."""
         _draw(ring_imgs[slot], ring_all_axes[slot], ring_titles[slot],
               data_idx, title_str, border, border_w)
 
     def blank_grid():
+        """Blank every right-grid tile (no spectrogram, faint gray border)."""
         for s in range(n_grid_slots):
             render_grid_slot(s, None, '', 'lightgray', 0.3)
 
     def blank_ring():
+        """Blank every ring tile (no spectrogram, faint gray border)."""
         for s in range(len(ring_all_axes)):
             render_ring_slot(s, None, '', 'lightgray', 0.3)
 
     def set_grid_visible(vis):
+        """Show/hide all right-grid tile axes."""
         for ax in ax_grid:
             ax.set_visible(vis)
 
     def set_ring_visible(vis):
+        """Show/hide all ring tile axes."""
         for ax in ring_all_axes:
             ax.set_visible(vis)
 
@@ -590,6 +712,14 @@ def make_traversal_video(
              'last_inset_count': 0, 'reached_part': 0}
 
     def on_phase_enter(pi):
+        """Reconfigure all shared artists for the first frame of phase `pi`.
+
+        Resets the trail/start marker, toggles the title card, grid, ring, and
+        insets for the phase kind, paints the static content (cluster ring tiles
+        or blanked traversal grid), updates the suptitle/subtitle, and clears the
+        per-phase reveal/inset counters in ``state``. Pure side-effects on the
+        captured matplotlib artists.
+        """
         ph = phases[pi]
 
         # Title card → hide everything below it
@@ -651,6 +781,14 @@ def make_traversal_video(
 
     # ── Per-frame update ──────────────────────────────────────────────
     def update(frame_idx):
+        """Advance the animation to global frame `frame_idx` (mutates artists).
+
+        Dispatches to ``on_phase_enter`` on phase boundaries, then for traversal
+        phases updates the left-panel trail/start marker and progressively
+        reveals newly-passed right-grid tiles and left-panel insets based on the
+        precomputed ``reveal_frames``/``inset_frames`` and the ``state`` counts.
+        Returns an empty list (``blit=False``).
+        """
         pi, fi = frames_info[frame_idx]
         ph = phases[pi]
 
@@ -742,6 +880,7 @@ def make_traversal_video(
                 state['last_inset_count'] = ins_count
         return []
 
+    # ── Render + save ──────────────────────────────────────────────────
     ani = FuncAnimation(fig, update, frames=len(frames_info),
                          interval=1000 / fps, blit=False)
 
