@@ -193,18 +193,111 @@ def load_gerbils(gerbil_filepath,families=[2],test_size=0.2,seed=92,check=True):
 
     return (train_fns,test_fns),(train_ids,test_ids),specs_per_file
 
-def load_mouse_data(data_dir):
-    """Load pre-processed mouse vocalization data from .pt files.
+def _npz_to_data_dict(npz_path):
+    """Read one .npz split into the dict shape mouse_data expects.
 
-    Expects train_data.pt and val_data.pt in data_dir, each a dict with at
+    Numeric arrays become torch tensors (zero-copy via from_numpy); string
+    arrays (spec_id, and the session_id/session_type columns written by
+    usv-playpen's build-qlvm-training-set) become plain lists of str, because
+    mouse_data indexes spec_ids with a list comprehension.
+
+    The whole split is read into RAM — unlike the .pt path there is no mmap.
+    """
+    data_dict = {}
+    with np.load(npz_path, allow_pickle=False) as handle:
+        for key in handle.files:
+            column = handle[key]
+            if column.dtype.kind in ('U', 'S', 'O'):
+                data_dict[key] = [str(value) for value in column]
+            else:
+                data_dict[key] = torch.from_numpy(column)
+    return data_dict
+
+
+def _load_split(data_dir, stem):
+    """Load ``<stem>.pt`` if present, else ``<stem>.npz``, from data_dir."""
+    pt_path = os.path.join(data_dir, f'{stem}.pt')
+    if os.path.isfile(pt_path):
+        return torch.load(pt_path, mmap=True)
+
+    npz_path = os.path.join(data_dir, f'{stem}.npz')
+    if os.path.isfile(npz_path):
+        return _npz_to_data_dict(npz_path)
+
+    raise FileNotFoundError(
+        f"neither {stem}.pt nor {stem}.npz found in {data_dir}"
+    )
+
+
+def load_mouse_data(data_dir):
+    """Load pre-processed mouse vocalization data from .pt or .npz files.
+
+    Expects train_data and val_data in data_dir, each a dict with at
     minimum a 'spectrograms' key (torch.Tensor, shape N x C x H x W) and
     optionally a 'spec_id' key.
 
+    Two on-disk formats are accepted, ``.pt`` taking precedence when both are
+    present. ``.pt`` is the torch dict written by preprocess_and_save_data.py
+    (memory-mapped). ``.npz`` is the numpy archive written by usv-playpen's
+    ``build-qlvm-training-set`` (read into RAM).
+
     Returns (train_dict, val_dict).
     """
-    train_dict = torch.load(os.path.join(data_dir, 'train_data.pt'), mmap=True)
-    val_dict   = torch.load(os.path.join(data_dir, 'val_data.pt'), mmap=True)
-    return train_dict, val_dict
+    return _load_split(data_dir, 'train_data'), _load_split(data_dir, 'val_data')
+
+
+def load_full_mouse_data(data_dir):
+    """Load one combined dict over every spectrogram in data_dir.
+
+    Prefers a single ``full_data`` file (``.pt`` then ``.npz``). When the
+    directory holds only a train/val pair — as the multi-condition sets built by
+    usv-playpen's ``build-qlvm-training-set`` do — the two splits are
+    concatenated, train first, so inference still sees the whole dataset.
+
+    Returns a single data_dict.
+    """
+    for stem in ('full_data.pt', 'full_data.npz'):
+        path = os.path.join(data_dir, stem)
+        if os.path.isfile(path):
+            return torch.load(path, mmap=True) if stem.endswith('.pt') else _npz_to_data_dict(path)
+
+    train_dict, val_dict = load_mouse_data(data_dir)
+    shared = [key for key in train_dict if key in val_dict]
+    combined = {}
+    for key in shared:
+        left, right = train_dict[key], val_dict[key]
+        if isinstance(left, list):
+            combined[key] = list(left) + list(right)
+        elif getattr(left, 'ndim', 1) == 0:
+            # Per-set scalars (apply_mask), not row-aligned columns: carry one
+            # through rather than concatenating. The two splits come from the
+            # same build, so disagreement means the directory is mixed.
+            if bool(left != right):
+                raise ValueError(
+                    f"train and val disagree on {key!r} ({left} vs {right}); "
+                    f"{data_dir} holds splits from two different builds."
+                )
+            combined[key] = left
+        else:
+            combined[key] = torch.cat([left, right])
+    print(f"No full_data in {data_dir}; concatenated train+val "
+          f"({len(train_dict['spectrograms'])} + {len(val_dict['spectrograms'])} specs)")
+    return combined
+
+
+def _subset_list(values, index):
+    """Index a plain list by a boolean mask or an integer index array.
+
+    Returns None unchanged, so optional columns (session_type, session_id) can be
+    threaded through the filtering/sampling stages without a presence check at
+    every site.
+    """
+    if values is None:
+        return None
+    index = np.asarray(index)
+    if index.dtype == bool:
+        return [value for value, keep in zip(values, index.tolist()) if keep]
+    return [values[i] for i in index]
 
 
 def _quantile_sample(bin_inds, durations, n):
@@ -227,6 +320,20 @@ class mouse_data(Dataset):
         'masks_len':    long tensor   (N,)
         'durations':    long tensor   (N,)
         'spec_id':      list of str   (N,)
+        'apply_mask':   0-d bool      (optional; see below)
+
+    Masking:
+        __getitem__ multiplies each spectrogram by its binarized mask. Sets built
+        by usv-playpen's build-qlvm-training-set with --apply-mask already have
+        the background zeroed on disk, so the multiply is idempotent there; sets
+        built with --no-apply-mask carry raw spectrograms alongside the same
+        masks, and must NOT be multiplied or the arm silently becomes masked.
+
+        The set says which it is: the builder writes a scalar 'apply_mask' into
+        every split, and it is honoured unless the apply_mask argument overrides
+        it. Sets predating that key (every .pt set, and .npz sets built before
+        the flag existed) have their masks applied, which is what they were built
+        for.
 
     Sampling is two-stage:
 
@@ -258,13 +365,47 @@ class mouse_data(Dataset):
                  samples_per_mask=None,    # used by "mask_duration"
                  total_samples=None,       # used by "subsample"
                  duration_aware=False,     # used by "subsample"
+                 # Masking: None = ask the data (default True if it does not say)
+                 apply_mask=None,
                  seed=42):
         spectrograms = data_dict['spectrograms']
         masks        = data_dict['masks']
         masks_len    = data_dict['masks_len']
         durations    = data_dict.get('durations', torch.zeros(len(spectrograms), dtype=torch.long))
         spec_ids     = data_dict.get('spec_id', [None] * len(spectrograms))
+        # Optional provenance columns, present in the multi-condition sets only.
+        # Kept as attributes rather than added to __getitem__'s tuple, because
+        # downstream consumers index that tuple positionally.
+        session_types = data_dict.get('session_type', None)
+        session_ids   = data_dict.get('session_id', None)
 
+        # Whether to multiply the spectrogram by its mask. The explicit argument
+        # wins; otherwise the set decides; otherwise the historical default.
+        declared = data_dict.get('apply_mask', None)
+        if apply_mask is None:
+            apply_mask = True if declared is None else bool(declared)
+            source = 'the dataset' if declared is not None else 'the default (dataset is silent)'
+        else:
+            apply_mask = bool(apply_mask)
+            source = 'the apply_mask argument'
+            if declared is not None and bool(declared) != apply_mask:
+                print(f'WARNING: apply_mask={apply_mask} overrides the dataset\'s own '
+                      f'apply_mask={bool(declared)}.')
+        self.apply_mask = apply_mask
+
+        # An all-zero mask column times a spectrogram is an all-zero spectrogram —
+        # a silent, total loss of signal rather than a crash. That is exactly what
+        # a masking_type='none' set holds (all-zero placeholders), so refuse it
+        # here instead of training on 128x128 of zeros.
+        if apply_mask and len(masks) and not bool(masks[:min(len(masks), 1024)].any()):
+            raise ValueError(
+                'apply_mask=True but the first 1024 masks are all zero — masking '
+                'these spectrograms would zero every one of them. This is what a '
+                "build-qlvm-training-set --masking-type none set looks like; pass "
+                'apply_mask=False, or rebuild with --masking-type sam.'
+            )
+
+        print(f'Masking: apply_mask={apply_mask}, from {source}.')
         print_masks_len_stats(masks_len, label='Full dataset')
 
         # Stage 1: Mask length filtering
@@ -274,7 +415,9 @@ class mouse_data(Dataset):
             masks        = masks[valid]
             masks_len    = masks_len[valid]
             durations    = durations[valid]
-            spec_ids     = [s for s, v in zip(spec_ids, valid.tolist()) if v]
+            spec_ids      = _subset_list(spec_ids, valid)
+            session_types = _subset_list(session_types, valid)
+            session_ids   = _subset_list(session_ids, valid)
             print_masks_len_stats(masks_len, label=f'After filtering masks_len to [{lo}, {hi}]')
 
         n_after_filter = len(spectrograms)
@@ -298,7 +441,9 @@ class mouse_data(Dataset):
             masks        = masks[selected]
             masks_len    = masks_len[selected]
             durations    = durations[selected]
-            spec_ids     = [spec_ids[i] for i in selected]
+            spec_ids      = _subset_list(spec_ids, selected)
+            session_types = _subset_list(session_types, selected)
+            session_ids   = _subset_list(session_ids, selected)
             print_masks_len_stats(masks_len, label=f'After mask_duration sampling (samples_per_mask={samples_per_mask})')
 
         elif sampling_strategy == 'subsample':
@@ -323,7 +468,9 @@ class mouse_data(Dataset):
                 masks        = masks[selected]
                 masks_len    = masks_len[selected]
                 durations    = durations[selected]
-                spec_ids     = [spec_ids[i] for i in selected]
+                spec_ids      = _subset_list(spec_ids, selected)
+                session_types = _subset_list(session_types, selected)
+                session_ids   = _subset_list(session_ids, selected)
                 print_masks_len_stats(masks_len, label=f'After subsample (total_samples={total_samples}, duration_aware={duration_aware})')
 
         elif sampling_strategy is not None:
@@ -337,6 +484,8 @@ class mouse_data(Dataset):
         self.masks_len    = masks_len
         self.durations    = durations
         self.spec_ids     = spec_ids
+        self.session_types = session_types
+        self.session_ids   = session_ids
         self.seed         = seed
 
         # --- Precomputed conditional fields ---
@@ -366,6 +515,7 @@ class mouse_data(Dataset):
             'samples_per_mask':  samples_per_mask,
             'total_samples':     total_samples,
             'duration_aware':    duration_aware,
+            'apply_mask':        apply_mask,
             'seed':              seed,
             'n_after_filter':    n_after_filter,
             'n_final':           len(self.spectrograms),
@@ -387,7 +537,8 @@ class mouse_data(Dataset):
         spec = (spec - spec_min) / (spec_max - spec_min + 1e-8)
 
         binary_mask = (mask > 0.5).float().unsqueeze(0)   # 1 x H x W
-        spec = spec * binary_mask
+        if self.apply_mask:
+            spec = spec * binary_mask
 
         return (
             spec,                              # 0: 1 x H x W
