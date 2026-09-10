@@ -65,7 +65,7 @@ from tqdm import tqdm
 
 # ── Local (qmc_deep_gen) ───────────────────────────────────────────────────
 from analysis.model_helpers import torus_forward
-from data.mouse_data import mouse_data
+from data.mouse_data import load_full_mouse_data, mouse_data
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -366,7 +366,7 @@ def make_traversal_video(
 
     Args:
         inference_dir: directory with arrays.npz + provenance JSON.
-        dataloc: directory holding full_data.pt (same as used at inference time).
+        dataloc: directory holding full_data.{pt,npz} or a train/val split (same as used at inference time).
         output_path: defaults to inference_dir/traversal_video.mp4.
         m: ring-neighbor count for cluster deep-dive panels (peak + m around it).
         fps: frames per second of the output video.
@@ -408,7 +408,7 @@ def make_traversal_video(
     if output_path is None:
         output_path = os.path.join(inference_dir, 'traversal_video.mp4')
 
-    full_dict = torch.load(os.path.join(dataloc, 'full_data.pt'), mmap=True)
+    full_dict = load_full_mouse_data(dataloc)
     full_ds = mouse_data(
         full_dict, filter_mask=pp['filter_mask'], lo=pp['lo'], hi=pp['hi'],
         sampling_strategy='subsample', total_samples=pp.get('total_samples'),

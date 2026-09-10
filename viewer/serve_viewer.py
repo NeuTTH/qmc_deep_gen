@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.mouse_data import mouse_data
+from data.mouse_data import load_full_mouse_data, mouse_data
 
 
 def _spec_png(spec_np: np.ndarray, height: int, width: int) -> bytes:
@@ -82,9 +82,8 @@ def serve(
     hi            = params.get('hi', 8)
     total_samples = params.get('total_samples', None)
 
-    data_file = os.path.join(dataloc, 'full_data.pt')
-    print(f'Loading {data_file} (mmap) ...')
-    full_dict = torch.load(data_file, mmap=True)
+    print(f'Loading full data from {dataloc} ...')
+    full_dict = load_full_mouse_data(dataloc)
     dataset = mouse_data(
         full_dict,
         filter_mask=filter_mask,

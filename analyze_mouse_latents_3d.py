@@ -28,7 +28,7 @@ from models.qmc_base import QMCLVM, TorusBasis
 from models.sampling import roberts_sequence, gen_korobov_basis
 from train.model_saving_loading import load
 from train.losses import binary_lp
-from data.mouse_data import load_mouse_data, mouse_data
+from data.mouse_data import load_full_mouse_data, load_mouse_data, mouse_data
 from analysis.model_helpers import get_posterior_summaries, torus_forward, torus_reverse
 
 
@@ -210,7 +210,7 @@ def analyze_mouse_latents_3d(
 
     Args:
         model_path:          Path to .tar checkpoint
-        dataloc:             Directory with full_data.pt (or train/val split)
+        dataloc:             Directory with full_data.{pt,npz}, or a train/val split (concatenated)
         save_dir:            Output directory
         n_lattice_points:    Number of lattice points for posterior computation
         lattice_type:        'roberts' or 'korobov'
@@ -240,7 +240,7 @@ def analyze_mouse_latents_3d(
 
     # ── Data ───────────────────────────────────────────────────────────────
     print('Loading mouse data...')
-    full_dict = torch.load(os.path.join(dataloc, 'full_data.pt'), mmap=True)
+    full_dict = load_full_mouse_data(dataloc)
     full_ds = mouse_data(full_dict, filter_mask=True, lo=1, hi=8,
                          sampling_strategy='mask_duration', samples_per_mask=samples_per_mask)
 

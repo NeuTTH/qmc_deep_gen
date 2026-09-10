@@ -39,7 +39,7 @@ from tqdm import tqdm
 
 from analysis.clustering import run_mean_shift_fast
 from analysis.model_helpers import get_posterior_summaries, torus_forward, torus_reverse
-from data.mouse_data import mouse_data
+from data.mouse_data import load_full_mouse_data, mouse_data
 from models.qmc_base import QMCLVM, TorusBasis
 from models.sampling import gen_fib_basis
 from train.losses import binary_lp
@@ -833,7 +833,7 @@ def run_inference(
 
     # ── Data ────────────────────────────────────────────────────────────────
     print('Loading mouse data...')
-    full_dict = torch.load(os.path.join(dataloc, 'full_data.pt'), mmap=True)
+    full_dict = load_full_mouse_data(dataloc)
     full_ds = mouse_data(full_dict, filter_mask=filter_mask, lo=lo, hi=hi,
                          sampling_strategy='subsample', total_samples=total_samples)
     n_workers = min(24, len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else 4)
