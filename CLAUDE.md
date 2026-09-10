@@ -65,7 +65,27 @@ Generates QMC sequences:
 ### Data (`data/`)
 
 - `bird_data.py` — HDF5-based bird vocalization spectrograms with conditional factors; `hdf5_data_general` handles HDF5s of unknown per-file length
-- `mouse_data.py` — mouse vocalization spectrograms from `.pt` files; `mouse_data` dataset supports equal sampling across syllable-length bins
+- `mouse_data.py` — mouse vocalization spectrograms; `mouse_data` dataset supports equal
+  sampling across syllable-length bins. `load_mouse_data(data_dir)` reads
+  `train_data`/`val_data` as either **`.pt`** (torch dict, memory-mapped — written by
+  `preprocess_and_save_data.py`) or **`.npz`** (numpy archive, read into RAM — written by
+  `usv-playpen build-qlvm-training-set`). `.pt` wins if both are present. The `.npz`
+  path converts numeric columns to tensors and string columns (`spec_id`, and the
+  `session_id`/`session_type` columns the multi-condition sets carry) to lists of `str`.
+
+  **Masking.** `__getitem__` multiplies each spectrogram by its binarized mask — but only if
+  `apply_mask` is on. The dataset decides: `build-qlvm-training-set` writes a scalar
+  `apply_mask` into every split, and `mouse_data` honours it (explicit `apply_mask=` argument
+  > the dataset's declaration > `True`, for `.pt` sets and `.npz` sets built before the flag
+  existed, which were all built masked). A set built with `--apply-mask` already has the
+  background zeroed on disk, so the multiply is idempotent there; a set built with
+  `--no-apply-mask` carries raw spectrograms alongside the same masks and must not be
+  multiplied. `mouse_data` raises rather than proceed when `apply_mask` is on and the mask
+  column is all zeros, which would silently zero every spectrogram (that is what a
+  `--masking-type none` set looks like). The effective value is recorded in
+  `sampling_config.json` next to the checkpoint. `load_full_mouse_data` carries such
+  per-set scalars through the train+val concatenation instead of trying to `torch.cat` them,
+  and errors if the two splits disagree.
 - `dynamics_data.py` — motion capture data (AMC format)
 - `toy_dsets.py` — synthetic datasets
 
@@ -80,6 +100,47 @@ Post-training analysis tools:
 - `jacobians.py` — Frobenius norm of decoder Jacobians over the lattice (measures coverage quality)
 - `clustering.py` — mean-shift and k-means on torus-periodic latent space
 - `geodesics.py`, `tda.py` — topological and geometric analysis of learned representations
+
+### Post-training analysis figures
+
+`analyze_mouse_latents_2d.py` (driven by `scripts/inference_2d.sh`) is the figure
+generator. It writes **five** figures plus one per watershed cluster:
+
+| File | What it is |
+|---|---|
+| `figure_E_embedded_grid.png` | Every latent-space colouring on one grid: mean frequency, SAM mask count, duration, session type (or condition, for legacy sets), emitter sex, social distance, the two social-distance segment overlays, and the aggregated posterior as a reference panel. Panels whose variable the dataset lacks are dropped, so the grid shrinks rather than filling with blank boxes. |
+| `figure_recon_mse.png` | Reconstruction MSE by mask count, by duration bin, by session type, and by session type x mask bin. The last two appear only when the dataset carries a `session_type` column. |
+| `figure_FG_posterior_and_examples.png` | Aggregated posterior with mean-shift centroids, plus one example spectrogram per cluster. |
+| `figure_grid_examples.png` | Decoder output over a `grid_size` x `grid_size` grid of torus cell centres. |
+| `figure_H_watershed_grid.png` | Watershed of the aggregated posterior swept over (smoothing σ, compactness). |
+| `figure_H_cluster_NN_samples.png` | One per cluster: its watershed basin on the posterior, and tile-sampled member spectrograms. |
+
+Alongside them: `recon_mse_breakdown.npz` (raw per-spectrogram numbers — `mse`,
+`mse_in_mask`, `mse_out_mask`, `spec_id`, `mask_counts`, `durations`, `mask_bin`,
+`session_types`, `apply_mask`), `cluster_info.json`, `posterior_cache.npz`, and
+`figure_E7_video_*.mp4` when behavioural features are available.
+
+`mse_in_mask` exists because whole-image MSE is not comparable between a masked and an
+unmasked run — a masked target is ~97 % exact zeros, a much easier image to fit. The in-mask
+error is scored on the same pixels either way.
+
+**Colour is centralised.** `plotting/figstyle.py` holds the session-type palette
+(the same seaborn `deep` hexes the dataset-construction figures in
+`scripts/dataset_construct/` use), the emitter-sex palette, and one colormap per
+quantity (`CMAP_SPEC`, `CMAP_POSTERIOR`, `CMAP_FREQ`, `CMAP_MASK_COUNT`,
+`CMAP_DURATION`, `CMAP_SOCIAL_DIST`, `CMAP_SEGMENT`). Import from there; do not
+re-declare hexes in a figure script.
+
+**`gen_fib_basis` returns the lattice unwrapped.** Its second column is
+`arange(n) * fib(m-1) / n`, which runs to tens of thousands — the model applies the
+`% 1` itself on every forward pass. Anything that treats a lattice coordinate as a
+position on the torus (a histogram, a KD-tree over raw coords) must wrap it first.
+Not wrapping it is what made the aggregated-posterior histogram two points wide and
+turned every watershed run on it into plain Voronoi cells.
+
+`inference_latents.py` / `inference_latents_agg.py` add watershed clustering with
+finer control (n_clusters vs bandwidth); `inference_latents_video.py` renders a
+latent-traversal video from an inference directory.
 
 ## Latent Space Geometry: Torus Structure and Distances
 
