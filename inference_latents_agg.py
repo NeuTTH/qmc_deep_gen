@@ -850,7 +850,11 @@ def run_inference(
     # ── Lattice ──────────────────────────────────────────────────────────────
     print(f'Generating Fibonacci lattice (m={lattice_m})...')
     lattice = gen_fib_basis(m=lattice_m)
-    lattice_np = lattice.numpy()
+    # gen_fib_basis returns the lattice UNWRAPPED (its second column runs to tens of
+    # thousands; the model applies the `% 1` on every forward pass). torus_forward is
+    # periodic and does not care, but anything that treats a coordinate as a position
+    # on the torus does -- build_aggregate_posterior_grid tiles it by +/-1.
+    lattice_np = lattice.numpy() % 1.0
     lattice_embedded = torus_forward(lattice_np)   # (N_lattice, 4)
     print(f'  Lattice size: {len(lattice_np)}')
 

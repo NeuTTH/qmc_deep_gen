@@ -788,7 +788,9 @@ def run_inference(
     # ── Lattice ──────────────────────────────────────────────────────────────
     print(f'Generating Fibonacci lattice (m={lattice_m})...')
     lattice = gen_fib_basis(m=lattice_m)
-    lattice_np = lattice.numpy()
+    # gen_fib_basis returns the lattice UNWRAPPED; wrap it before anything treats a
+    # coordinate as a position on the torus. torus_forward below is periodic either way.
+    lattice_np = lattice.numpy() % 1.0
     lattice_embedded = torus_forward(lattice_np)   # (N_lattice, 4)
     print(f'  Lattice size: {len(lattice_np)}')
 
