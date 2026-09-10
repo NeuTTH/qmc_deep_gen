@@ -26,9 +26,16 @@ from models.sampling import gen_fib_basis
 from train.model_saving_loading import load
 from train.losses import binary_lp
 from torch.optim import Adam
-from data.mouse_data import load_mouse_data, mouse_data
+from data.mouse_data import load_full_mouse_data, load_mouse_data, mouse_data
 from analysis.model_helpers import get_posterior_summaries, torus_forward, torus_reverse
 from analysis.clustering import run_mean_shift, run_mean_shift_fast
+from plotting.figstyle import (
+    SESSION_TYPE_COLORS, SESSION_TYPE_ORDER, COND_COLORS, COND_ORDER,
+    EMITTER_SEX_COLORS, EMITTER_SEX_ORDER, MISSING_COLOR,
+    CMAP_SPEC, CMAP_POSTERIOR, CMAP_FREQ, CMAP_MASK_COUNT, CMAP_DURATION,
+    CMAP_SOCIAL_DIST, CMAP_SEGMENT, OVERLAY_COLOR, HIGHLIGHT_COLOR,
+    SOCIAL_DIST_RANGE, session_type_color, bar_shades, scatter_params_for,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +56,53 @@ CONDITIONAL_REGISTRY = {
     "duration":   {"field_idx": 3, "c_dim": 1,  "label": "normalized duration"},
     "mean_freq":  {"field_idx": 4, "c_dim": 1,  "label": "mean frequency"},
 }
+
+
+CONDITION_SUFFIX = {
+    "courtship_mute_female": "mute",
+    "courtship_intact_partners": "intact",
+}
+
+
+def _refine_session_types(session_types, session_ids, csv_path):
+    """Split a sex-derived session_type by experimental condition.
+
+    ``session_types`` from build-qlvm-training-set encodes the SEX PAIRING only, so
+    two conditions run on the same pairing are indistinguishable afterwards. This
+    reads a ``session_id,condition`` CSV (written from the source session lists, so
+    it is authoritative rather than inferred) and appends a condition suffix where
+    one is defined -- ``MF`` -> ``MF_mute`` / ``MF_intact``.
+
+    Sessions absent from the table, and conditions with no suffix defined, keep
+    their original label: this only ever refines, never relabels across pairings.
+    """
+    import csv as _csv
+
+    condition_of = {}
+    with open(csv_path, newline='') as handle:
+        for row in _csv.DictReader(handle):
+            condition_of[row['session_id']] = row['condition']
+
+    types = np.array([str(t) for t in session_types], dtype=object)
+    ids = np.array([str(s) for s in session_ids], dtype=object)
+    refined, n_changed, unseen = types.copy(), 0, set()
+    for i, (label, sid) in enumerate(zip(types, ids)):
+        condition = condition_of.get(sid)
+        if condition is None:
+            unseen.add(sid)
+            continue
+        suffix = CONDITION_SUFFIX.get(condition)
+        if suffix is not None:
+            refined[i] = f"{label}_{suffix}"
+            n_changed += 1
+    counts = {k: int(v) for k, v in zip(*np.unique(refined, return_counts=True))}
+    print(f"Session conditions: refined {n_changed:,} of {len(types):,} labels "
+          f"from {csv_path}")
+    if unseen:
+        print(f"  WARNING: {len(unseen)} session(s) not in the condition table, "
+              f"label unchanged (e.g. {sorted(unseen)[:3]})")
+    print(f"  types now: {counts}")
+    return list(refined)
 
 
 def _make_c_fn(cond_name, device):
@@ -75,41 +129,60 @@ def _get_sample_c(dataset, index, cond_name, device):
     return val.unsqueeze(0).to(device)   # (1, c_dim)
 
 
-def plot_latent_scatter(
+def _style_latent_axis(ax, title=None, xlabel='Latent dimension 1',
+                       ylabel='Latent dimension 2'):
+    """Common framing for every panel that lives on the [0,1]^2 latent torus."""
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect('equal')
+    if xlabel:
+        ax.set_xlabel(xlabel, fontsize=11)
+    if ylabel:
+        ax.set_ylabel(ylabel, fontsize=11)
+    if title:
+        ax.set_title(title, fontsize=13, fontweight='bold')
+
+
+def draw_latent_scatter(
+    ax,
     latent_coords,
     color_values,
-    save_path,
     label,
-    cmap='viridis',
+    cmap=CMAP_FREQ,
     vmin=None,
     vmax=None,
     color_map=None,
     category_order=None,
     scatter_size=7,
     scatter_alpha=0.4,
+    title=None,
+    colorbar=True,
 ):
+    """Draw one 2-D latent scatter onto an existing axis.
+
+    Continuous mode (``color_map`` is None): ``color_values`` is numeric, NaN
+    entries are drawn in the shared missing-data grey behind the valid points, and
+    a colorbar labelled ``label`` is attached when ``colorbar``.
+
+    Discrete mode (``color_map`` is a ``{category: hex}`` dict): ``color_values``
+    is an object array, missing entries likewise drawn behind, and a legend
+    carrying per-category counts replaces the colorbar.
+
+    Returns the scatter mappable in continuous mode, else None.
     """
-    Plot 2-D latent scatter with continuous colormap or discrete category colors.
-
-    Continuous mode (color_map is None):
-        color_values: numeric array (N,), NaN entries are drawn gray behind.
-        Adds a colorbar labeled `label`.
-
-    Discrete mode (color_map is a {category: hex} dict):
-        color_values: object array (N,), None/NaN entries drawn gray behind.
-        category_order: draw order (default: sorted keys of color_map).
-        Adds a legend.
-    """
-    fig, ax = plt.subplots(figsize=(6, 6))
-
+    sc = None
+    scatter_size, scatter_alpha = scatter_params_for(
+        len(latent_coords), scatter_size, scatter_alpha)
     if color_map is None:
-        # --- continuous ---
         vals = np.asarray(color_values, dtype=float)
         nan_mask = np.isnan(vals)
         if nan_mask.any():
+            # A panel where most samples lack the variable (social distance covers a
+            # minority of sessions) is otherwise a field of grey with the real points
+            # lost in it, so the missing layer is drawn fainter than the data.
             ax.scatter(
                 latent_coords[nan_mask, 0], latent_coords[nan_mask, 1],
-                c='lightgray', s=scatter_size, alpha=scatter_alpha,
+                c=MISSING_COLOR, s=scatter_size * 0.8, alpha=scatter_alpha * 0.45,
                 rasterized=True, linewidth=0, marker='.', edgecolors='none',
             )
         valid = ~nan_mask
@@ -122,42 +195,123 @@ def plot_latent_scatter(
             s=scatter_size, alpha=scatter_alpha,
             rasterized=True, linewidth=0, marker='.', edgecolors='none',
         )
-        cbar = plt.colorbar(sc, ax=ax, shrink=0.5)
-        cbar.solids.set_alpha(1)
-        cbar.set_label(label, fontsize=10)
+        if colorbar:
+            cbar = ax.figure.colorbar(sc, ax=ax, shrink=0.72, pad=0.02)
+            cbar.solids.set_alpha(1)
+            cbar.set_label(label, fontsize=9)
     else:
-        # --- discrete ---
         cats = np.asarray(color_values, dtype=object)
-        nan_mask = np.array([c is None or (isinstance(c, float) and np.isnan(c)) for c in cats])
+        nan_mask = np.array([c is None or (isinstance(c, float) and np.isnan(c))
+                             for c in cats])
         if nan_mask.any():
+            # A panel where most samples lack the variable (social distance covers a
+            # minority of sessions) is otherwise a field of grey with the real points
+            # lost in it, so the missing layer is drawn fainter than the data.
             ax.scatter(
                 latent_coords[nan_mask, 0], latent_coords[nan_mask, 1],
-                c='lightgray', s=scatter_size, alpha=scatter_alpha,
+                c=MISSING_COLOR, s=scatter_size * 0.8, alpha=scatter_alpha * 0.45,
                 rasterized=True, linewidth=0, marker='.', edgecolors='none',
             )
         order = category_order if category_order is not None else sorted(color_map)
+        # Proxy handles rather than the scatters themselves: the points are drawn
+        # small and nearly transparent, and a legend swatch inheriting that is
+        # invisible however far markerscale is turned up.
+        handles = []
         for cat in order:
             mask = cats == cat
             if not mask.any():
                 continue
             ax.scatter(
                 latent_coords[mask, 0], latent_coords[mask, 1],
-                c=color_map[cat], label=cat,
+                c=color_map[cat],
                 s=scatter_size, alpha=scatter_alpha,
                 rasterized=True, linewidth=0, marker='.', edgecolors='none',
             )
-        ax.legend(markerscale=4, fontsize=9, loc='best')
+            handles.append(mpl.lines.Line2D(
+                [], [], marker='o', linestyle='none', markersize=6,
+                color=color_map[cat], label=f'{cat} (n={int(mask.sum()):,})'))
+        if nan_mask.any():
+            handles.append(mpl.lines.Line2D(
+                [], [], marker='o', linestyle='none', markersize=6,
+                color=MISSING_COLOR, label=f'missing (n={int(nan_mask.sum()):,})'))
+        ax.legend(handles=handles, fontsize=8, loc='upper right', framealpha=0.85)
 
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_xlabel('Latent dimension 1', fontsize=12)
-    ax.set_ylabel('Latent dimension 2', fontsize=12)
-    ax.set_title('Embedded latents', fontsize=14, fontweight='bold')
-    ax.set_aspect('equal')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f'Saved: {os.path.basename(save_path)}')
-    plt.close()
+    _style_latent_axis(ax, title=title)
+    return sc
+
+
+def draw_posterior_density(ax, heatmap, title='Aggregated posterior',
+                           label='Aggregated posterior', colorbar=True,
+                           percentile=95):
+    """Draw the aggregated-posterior image on an axis, clipped at a percentile.
+
+    Every figure that shows the posterior goes through here, so the density is
+    always the same colormap and the same vmax rule.
+    """
+    nz = heatmap[heatmap > 0]
+    vmax = float(np.percentile(nz, percentile)) if nz.size else None
+    im = ax.imshow(
+        heatmap, origin='lower', extent=(0, 1, 0, 1), cmap=CMAP_POSTERIOR,
+        interpolation='nearest', vmin=0, vmax=vmax, aspect='equal',
+    )
+    if colorbar:
+        cbar = ax.figure.colorbar(im, ax=ax, shrink=0.72, pad=0.02)
+        cbar.solids.set_alpha(1)
+        cbar.set_label(label, fontsize=9)
+    _style_latent_axis(ax, title=title)
+    return im
+
+
+def _grid_shape(n_panels, candidates=(3, 4)):
+    """Column count leaving the fewest empty slots, then the fewest rows."""
+    best = min(
+        candidates,
+        key=lambda c: (int(np.ceil(n_panels / c)) * c - n_panels,
+                       int(np.ceil(n_panels / c))),
+    )
+    return best, int(np.ceil(n_panels / best))
+
+
+def figure_E_grid(panels, save_path, n_cols=None, panel_size=5.0, dpi=200,
+                  suptitle='Embedded latents'):
+    """Lay every Figure-E panel on one grid, drawn on the same latent map.
+
+    ``panels`` is a list of ``(title, draw_fn)``; ``draw_fn(ax)`` draws one panel.
+    Panels whose variable is absent from the dataset are dropped by the caller
+    rather than blanked, so a run without behavioural features produces a smaller
+    grid instead of a grid of empty boxes. Each panel is lettered so a caption can
+    point at one without repeating its title.
+    """
+    if not panels:
+        print('  no Figure-E panels available; skipping figure_E_embedded_grid.png')
+        return
+
+    if n_cols is None:
+        n_cols, n_rows = _grid_shape(len(panels))
+    else:
+        n_rows = int(np.ceil(len(panels) / n_cols))
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(n_cols * panel_size * 1.18, n_rows * panel_size),
+    )
+    axes = np.atleast_1d(axes).ravel()
+
+    for k, (title, draw_fn) in enumerate(panels):
+        ax = axes[k]
+        draw_fn(ax)
+        ax.text(
+            -0.08, 1.04, chr(ord('A') + k), transform=ax.transAxes,
+            fontsize=15, fontweight='bold', ha='right', va='bottom',
+        )
+    for ax in axes[len(panels):]:
+        ax.axis('off')
+
+    fig.suptitle(suptitle, fontsize=16, fontweight='bold')
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    print(f'Saved: {os.path.basename(save_path)}  ({len(panels)} panels, '
+          f'{n_rows}x{n_cols})')
+    plt.close(fig)
 
 
 def compute_mean_frequency(spectrogram, freq_bins=None, freq_range_khz=None):
@@ -254,45 +408,43 @@ def _torus_segments(p1, p2):
     return result
 
 
-def plot_continuous_segments_overlay(
+def draw_segments_overlay(
+    ax,
     latent_coords,
     base_color_values,
     segments_coords,
     segments_dist,
-    save_path,
     title,
     direction='decreasing',
-    cmap_name='RdYlGn',
+    cmap_name=CMAP_SEGMENT,
     max_lines=10,
     scatter_size=5,
     scatter_alpha=0.2,
-    vmin=0,
-    vmax=85,
+    vmin=SOCIAL_DIST_RANGE[0],
+    vmax=SOCIAL_DIST_RANGE[1],
+    colorbar=True,
 ):
-    """
-    Plot duration-colored scatter with continuous segment trajectories overlaid.
+    """Draw duration-coloured scatter with social-distance trajectories on an axis.
 
     Args:
         latent_coords: (N, 2) array of all latent positions
-        base_color_values: (N,) durations for background scatter coloring
+        base_color_values: (N,) durations for the background scatter
         segments_coords: list of (N_i, 2) arrays, one per segment
         segments_dist: list of (N_i,) social distance arrays, one per segment
-        save_path: output file path
-        title: plot title
-        direction: 'decreasing' or 'increasing' — controls annotation text
-        cmap_name: colormap for segment lines (RdYlGn: green=close, red=far)
-        max_lines: cap on number of segments drawn
+        title: panel title
+        direction: 'decreasing' or 'increasing' -- controls the annotation text
+        cmap_name: colormap for the segment lines (green = close, red = far)
+        max_lines: cap on the number of segments drawn
         vmin/vmax: social distance colormap range
     """
     from matplotlib.collections import LineCollection
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-
-    # Background scatter colored by duration
+    scatter_size, scatter_alpha = scatter_params_for(
+        len(latent_coords), scatter_size, scatter_alpha)
     vals = np.asarray(base_color_values, dtype=float)
     ax.scatter(
         latent_coords[:, 0], latent_coords[:, 1],
-        c=vals, cmap='magma',
+        c=vals, cmap=CMAP_DURATION,
         s=scatter_size, alpha=scatter_alpha,
         rasterized=True, linewidth=0, marker='.', edgecolors='none',
     )
@@ -315,33 +467,24 @@ def plot_continuous_segments_overlay(
         lc.set_array(np.array(all_colors))
         ax.add_collection(lc)
 
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_xlabel('Latent dimension 1', fontsize=12)
-    ax.set_ylabel('Latent dimension 2', fontsize=12)
-    ax.set_title(title, fontsize=13, fontweight='bold')
-    ax.set_aspect('equal')
+    _style_latent_axis(ax, title=title)
 
-    sm = mpl.cm.ScalarMappable(cmap=cmap_name, norm=norm)
-    sm.set_array([])
-    # cbar = plt.colorbar(sm, ax=ax, shrink=0.5)
-    # cbar.solids.set_alpha(1)
-    # cbar.set_label('Social distance (cm)', fontsize=10)
+    if colorbar:
+        sm = mpl.cm.ScalarMappable(cmap=cmap_name, norm=norm)
+        sm.set_array([])
+        cbar = ax.figure.colorbar(sm, ax=ax, shrink=0.72, pad=0.02)
+        cbar.set_label('Social distance (cm)', fontsize=9)
 
-    if direction == 'decreasing':
-        color_note = 'red = far apart  \u2192  green = close'
-    else:
-        color_note = 'green = close  \u2192  red = far apart'
+    # RdYlGn maps the low end of the range to red, and the low end here is 0 cm, so
+    # red is close and green is far. The note used to claim the opposite.
+    arrow = ('green \u2192 red' if direction == 'decreasing'
+             else 'red \u2192 green')
     ax.text(
-        0.5, -0.10, color_note,
+        0.5, -0.13,
+        f'red = close, green = far apart   (over time: {arrow})',
         transform=ax.transAxes, ha='center', va='top',
         fontsize=9, color='dimgray',
     )
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f'Saved: {os.path.basename(save_path)}')
-    plt.close()
 
 
 def make_segment_video(
@@ -373,6 +516,22 @@ def make_segment_video(
                  current frame is highlighted with a distance-colored border.
     Labels     : session datetime, current USV start/end time (converted to seconds).
     """
+    # Writing an .mp4 needs an ffmpeg writer, and samv2_env has none -- matplotlib
+    # registers only ['pillow', 'html'] there. Animation.save(writer='ffmpeg') does
+    # not report that: it silently falls back to PillowWriter, whose __init__ takes
+    # no extra_args, so the save below raises
+    #     TypeError: AbstractMovieWriter.__init__() got an unexpected keyword
+    #                argument 'extra_args'
+    # and kills the whole figure run at figure E7. This went unnoticed because the
+    # per-draw datasets never produced a segment longer than min_seg_len, so this
+    # function was never called; the full-corpus set is the first input dense enough
+    # to reach it. Skip the video and keep every other figure. Install ffmpeg into
+    # the environment to get the videos back.
+    from matplotlib.animation import writers as _mpl_writers
+    if not _mpl_writers.is_available('ffmpeg'):
+        print(f"  no ffmpeg writer available (matplotlib has {_mpl_writers.list()}); "
+              f"skipping video {os.path.basename(save_path)}")
+        return
     import matplotlib.gridspec as gridspec
     from matplotlib.animation import FuncAnimation
     from datetime import datetime
@@ -436,7 +595,7 @@ def make_segment_video(
     bg_vals = np.asarray(durations_bg, dtype=float)
     ax_lat.scatter(
         latent_coords_bg[:, 0], latent_coords_bg[:, 1],
-        c=bg_vals, cmap='magma',
+        c=bg_vals, cmap=CMAP_DURATION,
         s=scatter_size, alpha=scatter_alpha,
         rasterized=True, linewidth=0, marker='.', edgecolors='none',
     )
@@ -462,7 +621,7 @@ def make_segment_video(
         spec = full_ds[all_didx[k]][0].squeeze().numpy()
         im = ax_s.imshow(
             spec, aspect='auto', origin='lower',
-            cmap='magma', interpolation='nearest',
+            cmap=CMAP_SPEC, interpolation='nearest',
             vmin=0, vmax=1,
         )
         ax_s.set_xticks([])
@@ -568,7 +727,7 @@ def grid_examples(model, grid_size, save_path, device, c=None):
     for i in range(grid_size):
         for j in range(grid_size):
             ax = axes[grid_size - 1 - i, j]  # flip y so row 0 is bottom
-            ax.imshow(recon[i * grid_size + j], cmap='viridis', origin='lower', aspect='auto')
+            ax.imshow(recon[i * grid_size + j], cmap=CMAP_SPEC, origin='lower', aspect='auto')
             ax.set_xticks([]); ax.set_yticks([])
     plt.suptitle(f'Grid reconstructions ({grid_size}x{grid_size})', fontsize=12, fontweight='bold')
     plt.tight_layout()
@@ -577,20 +736,28 @@ def grid_examples(model, grid_size, save_path, device, c=None):
     plt.close()
 
 
-def figure_H_watershed_variants(heatmap, centers, latent_coords, mean_freqs,
-                                 scatter_size, scatter_alpha, save_path):
-    """5x5 grid of watershed variants over (sigma, compactness).
+def figure_H_watershed_variants(posterior, centers, save_path,
+                                sigmas=(1, 3, 6, 12, 20),
+                                compacts=(0, 0.05, 0.2, 0.5, 2.0)):
+    """Watershed sweep over (sigma, compactness), drawn on the aggregated posterior.
 
-    Background: the smoothed heatmap used by watershed in each cell, so
-    boundaries can be judged against the density the algorithm actually sees.
+    Every cell shows the aggregated posterior the algorithm is segmenting, smoothed
+    by that row's sigma, so a boundary can be judged against the density it is
+    supposed to follow. The sweep and the shipped segmentation therefore run on the
+    same field.
+
+    This used to render as a flat purple square with four corner blobs, because the
+    lattice it histogrammed came straight from ``gen_fib_basis``, whose second
+    column is unwrapped (it runs to tens of thousands, the model applies the ``% 1``
+    itself). Only the handful of lattice points whose raw coordinate happened to
+    land inside [0, 1] were binned, so the "posterior" was two points wide and
+    watershed segmented a flat field into Voronoi cells. The caller now wraps the
+    lattice before histogramming it.
     """
     from scipy.ndimage import gaussian_filter
     from skimage.segmentation import watershed
 
-    sigmas   = [1, 3, 6, 12, 20]
-    compacts = [0, 0.05, 0.2, 0.5, 2.0]
-
-    res = heatmap.shape[0]
+    res = posterior.shape[0]
     xx = np.linspace(0, 1, res)
     yy = np.linspace(0, 1, res)
 
@@ -603,154 +770,189 @@ def figure_H_watershed_variants(heatmap, centers, latent_coords, mean_freqs,
     fig, axes = plt.subplots(len(sigmas), len(compacts),
                              figsize=(len(compacts) * 4, len(sigmas) * 4))
     for row, sigma in enumerate(sigmas):
-        smoothed = gaussian_filter(heatmap, sigma=sigma)
+        smoothed = gaussian_filter(posterior, sigma=sigma, mode='wrap')
         nz = smoothed[smoothed > 0]
         vmax = float(np.percentile(nz, 95)) if nz.size else None
         for col, compact in enumerate(compacts):
             ax = axes[row, col]
-            labels_ws = watershed(-smoothed, markers=marker_img_base.copy(), compactness=compact)
-            # Show the smoothed heatmap watershed actually operates on — lets
-            # you judge whether boundaries fall at density valleys.
+            labels_ws = watershed(-smoothed, markers=marker_img_base.copy(),
+                                  compactness=compact)
             ax.imshow(smoothed, origin='lower', extent=(0, 1, 0, 1),
-                      cmap='viridis', vmin=0, vmax=vmax, aspect='equal',
+                      cmap=CMAP_POSTERIOR, vmin=0, vmax=vmax, aspect='equal',
                       interpolation='nearest')
             boundary_levels = np.arange(0.5, len(centers) + 1.5)
             ax.contour(xx, yy, labels_ws, levels=boundary_levels,
-                       colors='white', linewidths=1.5)
+                       colors=OVERLAY_COLOR, linewidths=1.2)
             ax.scatter(centers[:, 0], centers[:, 1],
-                       c='white', s=80, marker='x', linewidths=2.0, zorder=10)
+                       c=OVERLAY_COLOR, s=60, marker='x', linewidths=1.6, zorder=10)
             ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.set_aspect('equal')
             ax.set_xticks([]); ax.set_yticks([])
             if row == 0:
-                ax.set_title(f'compact={compact}', fontsize=10, fontweight='bold')
+                ax.set_title(f'compact={compact}', fontsize=11, fontweight='bold')
             if col == 0:
-                ax.set_ylabel(f'σ={sigma}', fontsize=10, fontweight='bold')
-    plt.suptitle('Watershed segmentation grid  (rows=σ, cols=compactness)',
-                 fontsize=13, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-def figure_watershed_overlay(
-    latent_coords, ws_labels, centers,
-    heatmap_right,
-    durations,
-    scatter_size, scatter_alpha,
-    save_path,
-):
-    """
-    Two-panel figure with watershed boundaries overlaid on:
-      left  — scatter colored by duration
-      right — aggregated posterior heatmap (slightly less smoothed than FG left)
-    """
-    res = ws_labels.shape[0]
-    n_clusters = len(centers)
-    boundary_levels = np.arange(0.5, n_clusters + 1.5)
-    xx = np.linspace(0, 1, res)
-    yy = np.linspace(0, 1, res)
-    extent = (0, 1, 0, 1)
-
-    def _add_watershed(ax):
-        ax.contour(xx, yy, ws_labels, levels=boundary_levels,
-                   colors='white', linewidths=1.5, zorder=5)
-        for i, (cx, cy) in enumerate(centers):
-            ax.text(cx, cy, str(i + 1), color='white', fontsize=9,
-                    fontweight='bold', ha='center', va='center', zorder=6)
-        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-        ax.set_aspect('equal')
-        ax.set_xlabel('Latent dim 1', fontsize=11)
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
-
-    # --- Left: scatter by duration ---
-    ax = axes[0]
-    dur = np.asarray(durations, dtype=float)
-    nan_mask = np.isnan(dur)
-    if nan_mask.any():
-        ax.scatter(latent_coords[nan_mask, 0], latent_coords[nan_mask, 1],
-                   c='lightgray', s=scatter_size, alpha=scatter_alpha,
-                   rasterized=True, linewidth=0, marker='.', edgecolors='none')
-    valid = ~nan_mask
-    sort_idx = np.argsort(dur[valid])
-    sc = ax.scatter(
-        latent_coords[valid][sort_idx, 0], latent_coords[valid][sort_idx, 1],
-        c=dur[valid][sort_idx], cmap='magma',
-        s=scatter_size, alpha=scatter_alpha,
-        rasterized=True, linewidth=0, marker='.', edgecolors='none',
-    )
-    cbar = plt.colorbar(sc, ax=ax, shrink=0.6)
-    cbar.solids.set_alpha(1)
-    cbar.set_label('Duration (samples)', fontsize=10)
-    ax.set_ylabel('Latent dim 2', fontsize=11)
-    ax.set_title('Duration', fontsize=13, fontweight='bold')
-    _add_watershed(ax)
-
-    # --- Right: aggregated posterior heatmap (less smoothed, same style as FG left) ---
-    ax = axes[1]
-    nz = heatmap_right[heatmap_right > 0]
-    agg_vmax = float(np.percentile(nz, 95)) if nz.size else None
-    im2 = ax.imshow(
-        heatmap_right, origin='lower', extent=extent, cmap='viridis',
-        interpolation=None, vmin=0, vmax=agg_vmax, aspect='equal',
-    )
-    cbar = plt.colorbar(im2, ax=ax, shrink=0.6)
-    cbar.solids.set_alpha(1)
-    cbar.set_label('Aggregated posterior', fontsize=10)
-    ax.set_title('Aggregated posterior', fontsize=13, fontweight='bold')
-    _add_watershed(ax)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                ax.set_ylabel(f'\u03c3={sigma}', fontsize=11, fontweight='bold')
+    fig.suptitle('Watershed of the aggregated posterior  '
+                 '(rows = smoothing \u03c3, cols = compactness)',
+                 fontsize=14, fontweight='bold')
+    fig.tight_layout(rect=(0, 0, 1, 0.975))
+    fig.savefig(save_path, dpi=200, bbox_inches='tight')
     print(f'Saved: {os.path.basename(save_path)}')
-    plt.close()
+    plt.close(fig)
 
 
-def plot_recon_bars(mse_arr, mask_counts, durations, save_dir, n_dur_bins=5):
-    """Bar chart of mean reconstruction MSE grouped by mask count and duration bin."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+def _mask_bin_labels(mask_counts, top_bin=5):
+    """Bin mask counts as 1, 2, ... top_bin-1, '<top_bin>+'. Returns (labels, edges)."""
+    binned = np.clip(np.asarray(mask_counts, dtype=int), 1, top_bin)
+    labels = [str(b) for b in range(1, top_bin)] + [f"{top_bin}+"]
+    return binned, labels
 
-    # --- by mask count ---
-    ax = axes[0]
+
+def _panel_mse_by_mask_count(ax, mse_arr, mask_counts):
+    """Mean reconstruction MSE per SAM mask count."""
     unique_mls = np.sort(np.unique(mask_counts))
     means = [mse_arr[mask_counts == ml].mean() for ml in unique_mls]
-    sems  = [mse_arr[mask_counts == ml].std() / max(1, np.sqrt((mask_counts == ml).sum()))
-             for ml in unique_mls]
+    sems = [mse_arr[mask_counts == ml].std() / max(1, np.sqrt((mask_counts == ml).sum()))
+            for ml in unique_mls]
     ax.bar(np.arange(len(unique_mls)), means, yerr=sems, capsize=3,
-           color='steelblue', alpha=0.8, edgecolor='white')
+           color=bar_shades(CMAP_MASK_COUNT, len(unique_mls)),
+           edgecolor='white', linewidth=0.6)
     ax.set_xticks(np.arange(len(unique_mls)))
     ax.set_xticklabels([str(int(m)) for m in unique_mls])
-    ax.set_xlabel('masks_len (syllable length bins)', fontsize=11)
+    ax.set_xlabel('SAM mask count (syllable length bins)', fontsize=11)
     ax.set_ylabel('Mean reconstruction MSE', fontsize=11)
-    ax.set_title('Reconstruction MSE by mask count', fontsize=12, fontweight='bold')
+    ax.set_title('By mask count', fontsize=12, fontweight='bold')
 
-    # --- by duration bin ---
-    ax = axes[1]
+
+def _panel_mse_by_duration(ax, mse_arr, durations, n_dur_bins=5):
+    """Mean reconstruction MSE per duration quantile bin."""
     bin_edges = np.percentile(durations, np.linspace(0, 100, n_dur_bins + 1))
-    bin_edges[0]  -= 1
+    bin_edges[0] -= 1
     bin_edges[-1] += 1
     bin_labels, bin_means, bin_sems = [], [], []
     for b in range(n_dur_bins):
         lo, hi = bin_edges[b], bin_edges[b + 1]
-        mask = (durations >= lo) & (durations < hi)
-        if mask.sum() == 0:
+        sel = (durations >= lo) & (durations < hi)
+        if sel.sum() == 0:
             continue
         bin_labels.append(f'[{lo:.0f},{hi:.0f})')
-        bin_means.append(mse_arr[mask].mean())
-        bin_sems.append(mse_arr[mask].std() / max(1, np.sqrt(mask.sum())))
+        bin_means.append(mse_arr[sel].mean())
+        bin_sems.append(mse_arr[sel].std() / max(1, np.sqrt(sel.sum())))
     ax.bar(np.arange(len(bin_means)), bin_means, yerr=bin_sems, capsize=3,
-           color='darkorange', alpha=0.8, edgecolor='white')
+           color=bar_shades(CMAP_DURATION, len(bin_means)),
+           edgecolor='white', linewidth=0.6)
     ax.set_xticks(np.arange(len(bin_labels)))
     ax.set_xticklabels(bin_labels, rotation=30, ha='right', fontsize=9)
     ax.set_xlabel('Duration (samples)', fontsize=11)
     ax.set_ylabel('Mean reconstruction MSE', fontsize=11)
-    ax.set_title('Reconstruction MSE by duration', fontsize=12, fontweight='bold')
+    ax.set_title('By duration', fontsize=12, fontweight='bold')
 
-    plt.tight_layout()
-    out_path = os.path.join(save_dir, 'figure_recon_mse_bars.png')
-    plt.savefig(out_path, dpi=200, bbox_inches='tight')
-    print(f'Saved: figure_recon_mse_bars.png')
-    plt.close()
+
+def _panel_mse_by_type(ax, mse_arr, types, present):
+    """Mean reconstruction MSE per session type."""
+    means = [mse_arr[types == t].mean() for t in present]
+    sems = [mse_arr[types == t].std() / max(1, np.sqrt((types == t).sum()))
+            for t in present]
+    ax.bar(np.arange(len(present)), means, yerr=sems, capsize=3,
+           color=[session_type_color(t) for t in present],
+           edgecolor='white', linewidth=0.6)
+    ax.set_xticks(np.arange(len(present)))
+    ax.set_xticklabels([f'{t}\nn={int((types == t).sum()):,}' for t in present],
+                       fontsize=9)
+    ax.set_ylabel('Mean reconstruction MSE', fontsize=11)
+    ax.set_title('By session type', fontsize=12, fontweight='bold')
+
+
+def _panel_mse_by_type_and_mask(ax, mse_arr, types, present, binned, bin_labels,
+                                top_bin=5):
+    """Mean reconstruction MSE per session type x mask-count bin.
+
+    This is the panel that shows whether a draw rule bought anything in the bins it
+    up-weighted, so it gets the widest slot in the grid.
+    """
+    width = 0.8 / len(present)
+    for i, t in enumerate(present):
+        cell_means, cell_sems = [], []
+        for b in range(1, top_bin + 1):
+            sel = (types == t) & (binned == b)
+            cell_means.append(mse_arr[sel].mean() if sel.any() else np.nan)
+            cell_sems.append(mse_arr[sel].std() / np.sqrt(sel.sum())
+                             if sel.sum() > 1 else 0.0)
+        ax.bar(np.arange(top_bin) + i * width - 0.4 + width / 2, cell_means,
+               width=width, yerr=cell_sems, capsize=2, label=t,
+               color=session_type_color(t), edgecolor='white', linewidth=0.6)
+    ax.set_xticks(np.arange(top_bin))
+    ax.set_xticklabels(bin_labels)
+    ax.set_xlabel('SAM mask count', fontsize=11)
+    ax.set_ylabel('Mean reconstruction MSE', fontsize=11)
+    ax.set_title('By session type x mask count', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9, ncol=2)
+
+
+def figure_recon_mse(mse_arr, mask_counts, durations, save_dir, session_types=None,
+                     n_dur_bins=5, top_bin=5, extra_columns=None):
+    """Every reconstruction-MSE breakdown on one grid.
+
+    Panels: mask count, duration, session type, session type x mask-count bin. The
+    two session-type panels appear only when the dataset carries a ``session_type``
+    column -- the multi-condition sets from usv-playpen's build-qlvm-training-set
+    do, the older monolithic ones do not -- so a set without it produces a 1x2 row
+    rather than a grid with two empty boxes.
+
+    The raw per-spectrogram numbers go to ``recon_mse_breakdown.npz`` alongside, so
+    a cross-run comparison never has to be read back off the pixels.
+    """
+    types = None
+    present = []
+    if session_types is not None:
+        types = np.asarray(session_types, dtype=object)
+        present = [t for t in SESSION_TYPE_ORDER if (types == t).any()]
+        present += sorted({str(t) for t in np.unique(types)}
+                          - set(SESSION_TYPE_ORDER) - {"None"})
+
+    binned, bin_labels = _mask_bin_labels(mask_counts, top_bin=top_bin)
+
+    if present:
+        fig, axes = plt.subplots(2, 2, figsize=(13, 8.5))
+        axes = axes.ravel()
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4.3))
+        print("  no session types present; reconstruction grid is mask count + "
+              "duration only")
+
+    _panel_mse_by_mask_count(axes[0], mse_arr, mask_counts)
+    _panel_mse_by_duration(axes[1], mse_arr, durations, n_dur_bins=n_dur_bins)
+    if present:
+        _panel_mse_by_type(axes[2], mse_arr, types, present)
+        _panel_mse_by_type_and_mask(axes[3], mse_arr, types, present,
+                                    binned, bin_labels, top_bin=top_bin)
+
+    for k, ax in enumerate(axes):
+        ax.text(-0.08, 1.05, chr(ord('A') + k), transform=ax.transAxes,
+                fontsize=14, fontweight='bold', ha='right', va='bottom')
+
+    fig.suptitle('Reconstruction MSE', fontsize=15, fontweight='bold')
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    out_path = os.path.join(save_dir, 'figure_recon_mse.png')
+    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    print('Saved: figure_recon_mse.png')
+    plt.close(fig)
+
+    extra_columns = extra_columns or {}
+    # session_types is always written at full length, 'unknown' where the dataset
+    # does not carry the column. 09_fig8_qlvm_loss_compare.py indexes `mse` with
+    # `session_types == <type>`, so a zero-length column here would raise
+    # IndexError rather than select nothing.
+    np.savez(
+        os.path.join(save_dir, "recon_mse_breakdown.npz"),
+        mse=mse_arr, mask_counts=np.asarray(mask_counts),
+        durations=np.asarray(durations), mask_bin=binned,
+        session_types=(types.astype(str) if types is not None
+                       else np.full(len(mse_arr), "unknown", dtype="<U7")),
+        **extra_columns,
+    )
+    print("Saved: recon_mse_breakdown.npz "
+          f"(columns: mse, mask_counts, durations, mask_bin, session_types"
+          f"{''.join(', ' + k for k in extra_columns)})")
 
 
 def analyze_mouse_latents(
@@ -787,6 +989,8 @@ def analyze_mouse_latents(
     filter_mask=True,
     lo=1,
     hi=8,
+    apply_mask=None,
+    session_conditions=None,
 ):
     """
     Generate latent space analysis figures for mouse vocalization model.
@@ -816,6 +1020,15 @@ def analyze_mouse_latents(
             unconditional models. When set the decoder's first linear layer is widened
             by c_dim and conditioning tensors are extracted per-batch from the dataset.
             Choices: "mask_count" (8-D one-hot), "duration" (scalar), "mean_freq" (scalar).
+        apply_mask: Override whether spectrograms are multiplied by their mask.
+            Leave None to let the dataset decide -- an unmasked set built with
+            --no-apply-mask must be embedded unmasked, or the reconstruction
+            numbers describe a different input than the model was trained on.
+        session_conditions: Optional path to a session_id,condition CSV. Refines
+            session_type by experimental condition before any figure reads it --
+            build-qlvm-training-set derives session_type from subject sex alone, so
+            mute-female courtship sessions otherwise sit inside 'MF' next to the
+            intact-partner ones with nothing able to separate them.
         filter_mask: If True, filter dataset to syllables whose masks_len is in [lo, hi].
         lo: Lower bound (inclusive) on masks_len when filter_mask=True.
         hi: Upper bound (inclusive) on masks_len when filter_mask=True.
@@ -849,10 +1062,23 @@ def analyze_mouse_latents(
     # ## Using training data for better coverage
     # test_ds = mouse_data(train_dict, masks_len_range=(1, 8), equal_sampling=True, max_samples=max_samples)
     
-    full_dict = torch.load(os.path.join(dataloc, 'full_data.pt'), mmap=True)
+    full_dict = load_full_mouse_data(dataloc)
     full_ds = mouse_data(full_dict, filter_mask=filter_mask, lo=lo, hi=hi,
+                         apply_mask=apply_mask,
                          sampling_strategy='subsample', total_samples=total_samples)
-    
+
+    # Refine session_type from an experimental-condition table, before any figure
+    # reads it. build-qlvm-training-set derives session_type from subject SEX alone
+    # (dataset_session_types.py), so conditions that share a pairing collapse: a
+    # mute-female courtship session is male+female and lands in 'MF' next to the
+    # intact-partner sessions, with nothing downstream able to tell them apart.
+    # The CSV is authoritative (it is the source session lists), so it refines
+    # rather than guesses -- 'MF' becomes 'MF_mute' / 'MF_intact'.
+    if session_conditions:
+        full_ds.session_types = _refine_session_types(
+            full_ds.session_types, full_ds.session_ids, session_conditions)
+
+
     n_workers = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else 4
     test_loader = DataLoader(full_ds, num_workers=n_workers, shuffle=False, batch_size=batch_size)
 
@@ -891,7 +1117,14 @@ def analyze_mouse_latents(
     print(f"Lattice size: {len(lattice)} points")
 
     # Compute posteriors for all test samples (streaming — never materializes full matrix)
-    lattice_np = lattice.numpy()
+    #
+    # gen_fib_basis returns the lattice UNWRAPPED: the second column is
+    # arange(n) * fib(m-1) / n, which for m=24 runs to ~28656, and the model applies
+    # the `% 1` itself on every forward pass. Anything here that treats a lattice
+    # coordinate as a position on the [0,1]^2 torus -- the aggregated-posterior
+    # histogram below -- has to wrap it first, or it keeps only the two points whose
+    # raw coordinate happens to land inside the unit square.
+    lattice_np = lattice.numpy() % 1.0
     cache_path = os.path.join(save_dir, 'posterior_cache.npz')
     if cache_posteriors and os.path.exists(cache_path):
         print(f"Loading cached posteriors from {cache_path}...")
@@ -956,11 +1189,73 @@ def analyze_mouse_latents(
     mask_counts = np.concatenate(mask_counts_list)
     durations   = np.concatenate(durations_list)
 
+    # ============= Aggregated posterior density =============
+    # Built once here, before any figure draws it, so the Figure-E grid, Figure FG
+    # and the Figure-H watershed all show the same density.
+
+    # Build the aggregated posterior density as a 2D histogram.
+    #
+    # The description in the paper ("aggregated posterior density as a 2D histogram,
+    # Fig. 5B") is the density on the latent torus obtained by *marginalizing* the
+    # per-sample posteriors over the dataset. There are two equivalent ways to
+    # obtain it, with different numerical trade-offs:
+    #
+    #   (A) 'samples'  — histogram of per-sample posterior-mean latent coords
+    #                    (`latent_coords`, one point per test sample). Dense, robust,
+    #                    and independent of lattice resolution. Loses within-sample
+    #                    posterior spread (collapses each posterior to its mean).
+    #   (B) 'lattice'  — histogram2d of the lattice points weighted by `aggregated`
+    #                    = sum_s p(z_j | x_s). This is the exact marginal on the
+    #                    lattice. It needs `lattice_np` wrapped onto the torus (see
+    #                    above) and a torus-wrap Gaussian blur; without the wrap it
+    #                    collapsed to two points and every watershed run on it came
+    #                    out as plain Voronoi cells around the markers.
+    #   (C) 'kde'      — same weights as (B), but splatted onto the grid via a
+    #                    Gaussian kernel so the sparse lattice contribution is
+    #                    smoothed out. Effectively (B) + heavy smoothing.
+    #
+    # We default to (A) because it reproduces the "2D histogram" wording literally
+    # and gives a clean dense image; (B)+smoothing is computed alongside for the
+    # watershed step below so clusters snap to the true posterior mass and not
+    # just to where samples happened to land.
+    from scipy.ndimage import gaussian_filter
+
+    res = 200
+    edges = np.linspace(0, 1, res + 1)
+
+    # (A) Sample-space histogram — the image we actually plot.
+    heatmap_samples, _, _ = np.histogram2d(
+        latent_coords[:, 0], latent_coords[:, 1],
+        bins=[edges, edges],
+    )
+    heatmap_samples = heatmap_samples.T  # rows=y, cols=x for imshow
+
+    # (B) Lattice-weighted histogram, smoothed with a torus-wrap Gaussian. Used for
+    # the watershed segmentation further down and as the background of Figure H.
+    heatmap_lattice, _, _ = np.histogram2d(
+        lattice_np[:, 0], lattice_np[:, 1],
+        bins=[edges, edges], weights=aggregated,
+    )
+    heatmap_lattice = gaussian_filter(heatmap_lattice.T, sigma=2.0, mode='wrap')
+
+    # Light smoothing on the sample histogram too — purely cosmetic, keeps the
+    # image readable without hiding real structure.
+    heatmap = gaussian_filter(heatmap_samples, sigma=1.5, mode='wrap')
+
+
     # ============= Reconstruction MSE bar charts =============
     if compute_recon:
         print("\nComputing reconstruction MSE...")
         from train.losses import binary_lp as _lp_fnc
+        # Whole-image MSE is NOT comparable between a masked and an unmasked run:
+        # a masked target is ~97% exact zeros, which is a far easier image to fit.
+        # The in-mask error is measured on the same pixels either way, so it is the
+        # metric that survives the comparison. The out-of-mask error is kept too --
+        # for a masked run it measures how well the model reproduces the zeroing,
+        # and for an unmasked run how well it reproduces the background.
         all_mse = []
+        all_mse_in = []
+        all_mse_out = []
         model.eval()
         with torch.no_grad():
             for start in tqdm(range(0, len(full_ds), recon_batch_size), desc="recon MSE"):
@@ -976,41 +1271,45 @@ def analyze_mouse_latents(
                     recon = model.round_trip(lattice.to(device), specs, _lp_fnc, c=c_batch)
                 else:
                     recon = model.round_trip(lattice.to(device), specs, _lp_fnc)
-                mse = ((recon.cpu() - specs.cpu()) ** 2).mean(dim=(1, 2, 3)).numpy()
-                all_mse.extend(mse.tolist())
+                squared = (recon.cpu() - specs.cpu()) ** 2          # (B, 1, H, W)
+                all_mse.extend(squared.mean(dim=(1, 2, 3)).numpy().tolist())
+
+                inside = (torch.stack([it[6] for it in items]).unsqueeze(1) > 0.5)
+                n_in = inside.sum(dim=(1, 2, 3)).clamp(min=1)
+                n_out = (~inside).sum(dim=(1, 2, 3)).clamp(min=1)
+                all_mse_in.extend(
+                    ((squared * inside).sum(dim=(1, 2, 3)) / n_in).numpy().tolist())
+                all_mse_out.extend(
+                    ((squared * ~inside).sum(dim=(1, 2, 3)) / n_out).numpy().tolist())
         model.eval()  # keep in eval for subsequent figure generation
         mse_arr = np.array(all_mse, dtype=np.float32)
+        mse_in_arr = np.array(all_mse_in, dtype=np.float32)
+        mse_out_arr = np.array(all_mse_out, dtype=np.float32)
         print(f"  Mean MSE: {mse_arr.mean():.4f}  (std {mse_arr.std():.4f})")
-        plot_recon_bars(mse_arr, mask_counts, durations, save_dir, n_dur_bins=n_dur_bins)
+        print(f"  Mean MSE inside the SAM mask:  {mse_in_arr.mean():.4f}")
+        print(f"  Mean MSE outside the SAM mask: {mse_out_arr.mean():.4f}")
+        figure_recon_mse(
+            mse_arr, mask_counts, durations, save_dir,
+            session_types=getattr(full_ds, 'session_types', None),
+            n_dur_bins=n_dur_bins,
+            extra_columns={"mse_in_mask": mse_in_arr, "mse_out_mask": mse_out_arr,
+                           "apply_mask": np.array(full_ds.apply_mask),
+                           # spec_id makes a cross-run comparison verifiable rather
+                           # than an assumption about row order.
+                           "spec_id": np.asarray(full_ds.spec_ids, dtype=str)})
 
     print(f"Number of samples: {len(latent_coords)}")
     print(f"Latent coords range: X=[{latent_coords[:, 0].min():.3f}, {latent_coords[:, 0].max():.3f}], Y=[{latent_coords[:,1].min():.3f}, {latent_coords[:, 1].max():.3f}]")
     print(f"Unique points: {len(np.unique(latent_coords, axis=0))}")
 
-    # ============= FIGURE E1: Embedded latents colored by mean frequency =============
-    print("\nGenerating Figure E1: Embedded latents (colored by mean frequency)...")
+    # ============= FIGURE E: one grid, every colouring of the same latent map =====
+    # Each panel is the same embedding drawn against a different variable, so they
+    # only mean anything side by side. They used to be seven separate files at
+    # seven slightly different sizes, which is why they were never compared.
+    print("\nPreparing Figure E panels...")
     freq_unit = 'kHz' if freq_range_khz is not None else 'bins'
-    plot_latent_scatter(
-        latent_coords, mean_freqs,
-        save_path=os.path.join(save_dir, 'figure_E_embedded_latents_by_freq.png'),
-        label=f'Mean frequency ({freq_unit})',
-        cmap='viridis',
-        scatter_size=scatter_size, scatter_alpha=scatter_alpha,
-    )
 
-    # ============= FIGURE E2: Embedded latents colored by mask count =============
-    print("\nGenerating Figure E2: Embedded latents (colored by mask count)...")
-    plot_latent_scatter(
-        latent_coords, mask_counts,
-        save_path=os.path.join(save_dir, 'figure_E_embedded_latents_by_mask_count.png'),
-        label='SAM mask count (time bins)',
-        cmap='plasma',
-        scatter_size=scatter_size, scatter_alpha=scatter_alpha,
-    )
-
-    # ============= FIGURE E3: Embedded latents colored by condition =============
-    print("\nGenerating Figure E3: Embedded latents (colored by condition)...")
-
+    # ---- condition / session type -------------------------------------------- #
     lone_male_ids = {
         "20250912_155546",
         "20250912_170514",
@@ -1019,41 +1318,47 @@ def analyze_mouse_latents(
         "20250927_135343",
     }
 
-    # Parse spec_ids from dataset (already subsampled/indexed identically to latent_coords)
+    # The multi-condition sets built by usv-playpen carry a real session_type column,
+    # so use it; only fall back to parsing spec_id for the older monolithic sets
+    # whose ids encode the condition.
+    #
+    # The legacy parse expects "YYYYMMDD_HHMMSS_cond_avg_idx" and reads parts[2] as
+    # the condition. build-qlvm-training-set writes "{session_id}_{row_index}"
+    # instead, so parts[2] is a row number and EVERY label came out "Unknown" -- an
+    # empty figure with no error. Hence the explicit check below rather than a
+    # silent write.
     raw_spec_ids = full_ds.spec_ids  # list of str, same length as latent_coords
+    session_types = getattr(full_ds, "session_types", None)
+    if session_types is not None:
+        type_values = np.array([str(t) for t in session_types], dtype=object)
+        cond_values, cond_colors, cond_order = None, None, None
+        print("  condition read from the dataset's session_type column")
+    else:
+        type_values = None
+        cond_labels = []
+        for sid in raw_spec_ids:
+            if sid is None:
+                cond_labels.append("Unknown")
+                continue
+            parts = sid.split("_")
+            # Format: YYYYMMDD_HHMMSS_cond_avg_idx
+            datetime_str = f"{parts[0]}_{parts[1]}"
+            cond = parts[2] if len(parts) > 2 else "Unknown"
+            if cond == "ephys":
+                cond = "Lone-Male" if datetime_str in lone_male_ids else "Male-Female"
+            cond_labels.append(cond)
+        cond_values = np.array(cond_labels, dtype=object)
+        cond_colors, cond_order = COND_COLORS, COND_ORDER
+        print("  condition parsed from spec_id (no session_type column present)")
+        # Refuse to draw an empty panel. An unparseable id set used to produce a
+        # blank figure and a silent "0 samples" for every condition.
+        if int(np.isin(cond_values, COND_ORDER).sum()) == 0:
+            print(f"  no sample matched {COND_ORDER}; labels seen: "
+                  f"{sorted(set(cond_values))[:6]} -- dropping the condition panel")
+            cond_values = None
 
-    cond_labels = []
-    for sid in raw_spec_ids:
-        if sid is None:
-            cond_labels.append("Unknown")
-            continue
-        parts = sid.split("_")
-        # Format: YYYYMMDD_HHMMSS_cond_avg_idx
-        datetime_str = f"{parts[0]}_{parts[1]}"
-        cond = parts[2] if len(parts) > 2 else "Unknown"
-        if cond == "ephys":
-            cond = "Lone-Male" if datetime_str in lone_male_ids else "Male-Female"
-        cond_labels.append(cond)
-
-    cond_labels = np.array(cond_labels)
-
-    cond_order = ["Female-Female", "Male-Female", "Lone-Male"]
-    cond_colors = {"Female-Female": "#e377c2", "Male-Female": "#1f77b4", "Lone-Male": "#ff7f0e"}
-
-    plot_latent_scatter(
-        latent_coords, cond_labels,
-        save_path=os.path.join(save_dir, "figure_E_embedded_by_cond.jpg"),
-        label=None,
-        color_map=cond_colors, category_order=cond_order,
-        scatter_size=scatter_size, scatter_alpha=scatter_alpha,
-    )
-
-    # Print condition counts
-    for cond in cond_order:
-        print(f"  {cond}: {(cond_labels == cond).sum()} samples")
-
-    # ============= FIGURE E4 & E5: Behavioral features from pkl =============
-    # Parse session_id and row_idx from each spec_id: YYYYMMDD_HHMMSS_cond_avg_idx
+    # ---- behavioural features from the pkl ----------------------------------- #
+    # Parse session_id and row_idx from each spec_id: YYYYMMDD_HHMMSS_..._idx
     social_distances = []
     emitter_sexes = []
     for sid in raw_spec_ids:
@@ -1080,49 +1385,13 @@ def analyze_mouse_latents(
     social_distances = np.array(social_distances, dtype=float)
     emitter_sexes = np.array(emitter_sexes, dtype=object)
 
-    n_with_dist = np.sum(~np.isnan(social_distances))
-    n_with_sex = np.sum(emitter_sexes != None)
-    print(f"\nBehavioral features: {n_with_dist} samples with social distance, {n_with_sex} with emitter sex")
+    n_with_dist = int(np.sum(~np.isnan(social_distances)))
+    n_with_sex = int(np.sum(emitter_sexes != None))
+    print(f"  behavioural features: {n_with_dist:,} samples with social distance, "
+          f"{n_with_sex:,} with emitter sex")
 
-    # ---- Figure E4: Social distance (continuous) ----
-    print("\nGenerating Figure E4: Embedded latents (colored by social distance)...")
-    plot_latent_scatter(
-        latent_coords, social_distances,
-        save_path=os.path.join(save_dir, "figure_E_embedded_by_social_dist.jpg"),
-        label="Social distance (cm)",
-        cmap="YlOrRd_r", vmin=0, vmax=85,
-        scatter_size=scatter_size, scatter_alpha=scatter_alpha,
-    )
-
-    # ---- Figure E5: Emitter sex (discrete) ----
-    print("\nGenerating Figure E5: Embedded latents (colored by emitter sex)...")
-    sex_colors = {"female": "#d44fa8", "male": "#5baed4"}
-    sex_order = ["female", "male"]
-
-    plot_latent_scatter(
-        latent_coords, emitter_sexes,
-        save_path=os.path.join(save_dir, "figure_E_embedded_by_emitter_sex.jpg"),
-        label=None,
-        color_map=sex_colors, category_order=sex_order,
-        scatter_size=scatter_size, scatter_alpha=scatter_alpha,
-    )
-    nan_mask = np.array([s is None or (isinstance(s, float) and np.isnan(s)) for s in emitter_sexes])
-    for sex in sex_order:
-        print(f"  {sex}: {(emitter_sexes == sex).sum()} samples")
-    print(f"  NaN/missing: {nan_mask.sum()} samples")
-
-    # ============= FIGURE E6: Embedded latents colored by duration =============
-    print("\nGenerating Figure E6: Embedded latents (colored by duration)...")
-    plot_latent_scatter(
-        latent_coords, durations,
-        save_path=os.path.join(save_dir, "figure_E_embedded_by_duration.png"),
-        label="Duration (samples)",
-        cmap="magma",
-        scatter_size=scatter_size, scatter_alpha=scatter_alpha,
-    )
-
-    # ============= FIGURES E7 & E8: Continuous segment overlays =============
-    print("\nGenerating Figures E7 & E8: Continuous segment overlays...")
+    # ---- continuous social-distance segments --------------------------------- #
+    print("  finding continuous segments...")
     import pandas as pd
     from collections import defaultdict
 
@@ -1235,15 +1504,81 @@ def analyze_mouse_latents(
     inc_coords, inc_dist, inc_didx, inc_times, inc_sessions = select_top_segments('increasing')
     print(f"  Decreasing segments: {len(dec_coords)}, Increasing segments: {len(inc_coords)}")
 
-    print("\nGenerating Figure E7: Continuous segments (decreasing social distance)...")
-    plot_continuous_segments_overlay(
-        latent_coords, durations, dec_coords, dec_dist,
-        save_path=os.path.join(save_dir, 'figure_E7_segments_decreasing.jpg'),
-        title='Continuous segments — decreasing social distance',
-        direction='decreasing',
-        cmap_name='RdYlGn', vmin=0, vmax=85,
-        scatter_size=scatter_size, scatter_alpha=scatter_alpha,
-    )
+    dec_coords, dec_dist, dec_didx, dec_times, dec_sessions = select_top_segments('decreasing')
+    inc_coords, inc_dist, inc_didx, inc_times, inc_sessions = select_top_segments('increasing')
+    print(f"  decreasing segments: {len(dec_coords)}, increasing segments: {len(inc_coords)}")
+
+    # ---- assemble the grid ---------------------------------------------------- #
+    # A panel whose variable is absent from this dataset is dropped rather than
+    # drawn empty, so the grid shrinks instead of filling with blank boxes.
+    panels = [
+        ('Mean frequency', lambda ax: draw_latent_scatter(
+            ax, latent_coords, mean_freqs, f'Mean frequency ({freq_unit})',
+            cmap=CMAP_FREQ, title='Mean frequency',
+            scatter_size=scatter_size, scatter_alpha=scatter_alpha)),
+        ('SAM mask count', lambda ax: draw_latent_scatter(
+            ax, latent_coords, mask_counts, 'SAM mask count (time bins)',
+            cmap=CMAP_MASK_COUNT, title='SAM mask count',
+            scatter_size=scatter_size, scatter_alpha=scatter_alpha)),
+        ('Duration', lambda ax: draw_latent_scatter(
+            ax, latent_coords, durations, 'Duration (samples)',
+            cmap=CMAP_DURATION, title='Duration',
+            scatter_size=scatter_size, scatter_alpha=scatter_alpha)),
+    ]
+
+    if type_values is not None:
+        order = [t for t in SESSION_TYPE_ORDER if (type_values == t).any()]
+        order += sorted({str(t) for t in np.unique(type_values)}
+                        - set(SESSION_TYPE_ORDER) - {"None"})
+        colors = {t: session_type_color(t) for t in order}
+        panels.append(('Session type', lambda ax, o=order, c=colors: draw_latent_scatter(
+            ax, latent_coords, type_values, None, color_map=c, category_order=o,
+            title='Session type',
+            scatter_size=scatter_size, scatter_alpha=scatter_alpha)))
+        for session_type in order:
+            print(f"    {session_type}: {(type_values == session_type).sum():,} samples")
+    elif cond_values is not None:
+        panels.append(('Condition', lambda ax: draw_latent_scatter(
+            ax, latent_coords, cond_values, None,
+            color_map=cond_colors, category_order=cond_order, title='Condition',
+            scatter_size=scatter_size, scatter_alpha=scatter_alpha)))
+        for cond in cond_order:
+            print(f"    {cond}: {(cond_values == cond).sum():,} samples")
+
+    if n_with_sex > 0:
+        panels.append(('Emitter sex', lambda ax: draw_latent_scatter(
+            ax, latent_coords, emitter_sexes, None,
+            color_map=EMITTER_SEX_COLORS, category_order=EMITTER_SEX_ORDER,
+            title='Emitter sex',
+            scatter_size=scatter_size, scatter_alpha=scatter_alpha)))
+
+    if n_with_dist > 0:
+        panels.append(('Social distance', lambda ax: draw_latent_scatter(
+            ax, latent_coords, social_distances, 'Social distance (cm)',
+            cmap=CMAP_SOCIAL_DIST,
+            vmin=SOCIAL_DIST_RANGE[0], vmax=SOCIAL_DIST_RANGE[1],
+            title='Social distance',
+            scatter_size=scatter_size, scatter_alpha=scatter_alpha)))
+
+    if dec_coords:
+        panels.append(('Segments, closing', lambda ax: draw_segments_overlay(
+            ax, latent_coords, durations, dec_coords, dec_dist,
+            title='Segments \u2014 decreasing social distance',
+            direction='decreasing',
+            scatter_size=scatter_size, scatter_alpha=scatter_alpha)))
+    if inc_coords:
+        panels.append(('Segments, opening', lambda ax: draw_segments_overlay(
+            ax, latent_coords, durations, inc_coords, inc_dist,
+            title='Segments \u2014 increasing social distance',
+            direction='increasing',
+            scatter_size=scatter_size, scatter_alpha=scatter_alpha)))
+
+    # Reference panel: the density every other panel's points were drawn from, and
+    # the same image Figures FG and H segment.
+    panels.append(('Aggregated posterior', lambda ax: draw_posterior_density(
+        ax, heatmap, title='Aggregated posterior')))
+
+    figure_E_grid(panels, os.path.join(save_dir, 'figure_E_embedded_grid.png'))
 
     print("\nGenerating Figure E7 videos: top-3 decreasing-distance segments...")
     for vi in range(min(2, len(dec_coords))):
@@ -1293,69 +1628,8 @@ def analyze_mouse_latents(
             tail_times=tail_times_vi,
         )
 
-    print("\nGenerating Figure E8: Continuous segments (increasing social distance)...")
-    plot_continuous_segments_overlay(
-        latent_coords, durations, inc_coords, inc_dist,
-        save_path=os.path.join(save_dir, 'figure_E8_segments_increasing.jpg'),
-        title='Continuous segments — increasing social distance',
-        direction='increasing',
-        cmap_name='RdYlGn', vmin=0, vmax=85,
-        scatter_size=scatter_size, scatter_alpha=scatter_alpha,
-    )
-
-    # ============= FIGURE F: Aggregated posterior with mean-shift centroids =============
+    # ============= FIGURE F: mean-shift centroids over the aggregated posterior ====
     print("\nGenerating Figure F: Aggregated posterior...")
-
-    # Build the aggregated posterior density as a 2D histogram.
-    #
-    # The description in the paper ("aggregated posterior density as a 2D histogram,
-    # Fig. 5B") is the density on the latent torus obtained by *marginalizing* the
-    # per-sample posteriors over the dataset. There are two equivalent ways to
-    # obtain it, with different numerical trade-offs:
-    #
-    #   (A) 'samples'  — histogram of per-sample posterior-mean latent coords
-    #                    (`latent_coords`, one point per test sample). Dense, robust,
-    #                    and independent of lattice resolution. Loses within-sample
-    #                    posterior spread (collapses each posterior to its mean).
-    #   (B) 'lattice'  — histogram2d of the lattice points weighted by `aggregated`
-    #                    = sum_s p(z_j | x_s). This is the exact marginal on the
-    #                    lattice, but with a Fibonacci lattice of a few thousand
-    #                    points into a 200x200 grid most bins are empty and a few
-    #                    lattice-aligned bins dominate the colormap (the bug in the
-    #                    previous version). Fixable with a torus-wrap Gaussian blur.
-    #   (C) 'kde'      — same weights as (B), but splatted onto the grid via a
-    #                    Gaussian kernel so the sparse lattice contribution is
-    #                    smoothed out. Effectively (B) + heavy smoothing.
-    #
-    # We default to (A) because it reproduces the "2D histogram" wording literally
-    # and gives a clean dense image; (B)+smoothing is computed alongside for the
-    # watershed step below so clusters snap to the true posterior mass and not
-    # just to where samples happened to land.
-    from scipy.ndimage import gaussian_filter
-
-    res = 200
-    edges = np.linspace(0, 1, res + 1)
-
-    # (A) Sample-space histogram — the image we actually plot.
-    heatmap_samples, _, _ = np.histogram2d(
-        latent_coords[:, 0], latent_coords[:, 1],
-        bins=[edges, edges],
-    )
-    heatmap_samples = heatmap_samples.T  # rows=y, cols=x for imshow
-
-    # (B) Lattice-weighted histogram, smoothed with a torus-wrap Gaussian so the
-    # sparse Fibonacci lattice does not produce a near-empty grid. Used for the
-    # watershed segmentation further down.
-    heatmap_lattice, _, _ = np.histogram2d(
-        lattice_np[:, 0], lattice_np[:, 1],
-        bins=[edges, edges], weights=aggregated,
-    )
-    heatmap_lattice = gaussian_filter(heatmap_lattice.T, sigma=2.0, mode='wrap')
-
-    # Light smoothing on the sample histogram too — purely cosmetic, keeps the
-    # image readable without hiding real structure.
-    heatmap = gaussian_filter(heatmap_samples, sigma=1.5, mode='wrap')
-    extent = (0, 1, 0, 1)
 
     # Run mean-shift clustering
     print("Running mean-shift clustering...")
@@ -1407,29 +1681,12 @@ def analyze_mouse_latents(
     outer = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[1, 1.1], wspace=0.15)
 
     ax = fig.add_subplot(outer[0, 0])
-    # Render the aggregated posterior as a proper 2D histogram image. `heatmap`
-    # here is the (lightly-smoothed) histogram of per-sample posterior-mean
-    # latent coordinates (option A above). Clip vmax to the 99th percentile so a
-    # handful of dense bins do not flatten the colormap.
-    nz = heatmap[heatmap > 0]
-    agg_vmax = float(np.percentile(nz, 95)) if nz.size else None
-    im = ax.imshow(
-        heatmap, origin='lower', extent=extent, cmap='viridis',
-        interpolation=None, vmin=0, vmax=agg_vmax, aspect='equal',
-    )
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-    # ax.scatter(centers[:, 0], centers[:, 1], c='white', s=100, marker='.',
-    #            edgecolors='white', linewidths=0, zorder=10)
+    # Same drawer, same colormap and same vmax rule as every other panel that shows
+    # the posterior -- the Figure-E reference panel and the Figure-H background.
+    draw_posterior_density(ax, heatmap)
     for i, (x, y) in enumerate(centers):
-        ax.text(x, y, str(i + 1), color='White', fontsize=20, fontweight='bold',
-                ha='center', va='center', zorder=11)
-    ax.set_xlabel('Latent dimension 1', fontsize=12)
-    ax.set_ylabel('Latent dimension 2', fontsize=12)
-    ax.set_title('Aggregated posterior', fontsize=14, fontweight='bold')
-    ax.set_aspect('equal')
-    cbar = plt.colorbar(im, ax=ax, shrink=0.5)
-    cbar.solids.set_alpha(1)
-    cbar.set_label('Aggregated posterior', fontsize=10)
+        ax.text(x, y, str(i + 1), color=OVERLAY_COLOR, fontsize=18,
+                fontweight='bold', ha='center', va='center', zorder=11)
 
     right_gs = gridspec.GridSpecFromSubplotSpec(n_rows_g, n_cols_g, subplot_spec=outer[0, 1],
                                                  hspace=0.25, wspace=0.1)
@@ -1441,8 +1698,9 @@ def analyze_mouse_latents(
             if len(cluster_samples) > 0:
                 example_idx = cluster_samples[np.random.choice(len(cluster_samples))]
                 spec = full_ds[example_idx][0].numpy().squeeze()
-                ax_s.imshow(spec, cmap='viridis', origin='lower', aspect='auto')
-                ax_s.set_title(f'{cluster_id + 1}', color='red', fontsize=12, fontweight='bold')
+                ax_s.imshow(spec, cmap=CMAP_SPEC, origin='lower', aspect='auto')
+                ax_s.set_title(f'{cluster_id + 1}', color=HIGHLIGHT_COLOR,
+                               fontsize=12, fontweight='bold')
             else:
                 ax_s.text(0.5, 0.5, 'Empty', ha='center', va='center', transform=ax_s.transAxes)
         else:
@@ -1502,26 +1760,14 @@ def analyze_mouse_latents(
     sample_py = np.clip((latent_coords[:, 1] * res).astype(int), 0, res - 1)
     sample_cluster = ws_labels[sample_py, sample_px]  # 1..n_clusters_found
 
-    # ============= FIGURE FH: Duration scatter + aggregated posterior with watershed =============
-    print("\nGenerating Figure FH: Watershed overlay...")
-    # Slightly less smoothing than FG left (sigma=1.5) — for plotting only
-    heatmap_fh_right = gaussian_filter(heatmap_samples, sigma=0.8, mode='wrap')
-    figure_watershed_overlay(
-        latent_coords=latent_coords,
-        ws_labels=ws_labels,
-        centers=centers,
-        heatmap_right=heatmap_fh_right,
-        durations=durations,
-        scatter_size=scatter_size,
-        scatter_alpha=scatter_alpha,
-        save_path=os.path.join(save_dir, 'figure_FH_watershed_overlay.png'),
-    )
-
     # ============= FIGURE H watershed grid search =============
+    # Figure FH used to sit here, pairing a duration scatter with the posterior under
+    # the same boundaries. It is gone: its posterior-plus-watershed view is what the
+    # sweep below and each per-cluster panel now draw, and its duration scatter is a
+    # panel of the Figure-E grid.
     print("\nGenerating Figure H: Watershed grid search (σ × compactness)...")
     figure_H_watershed_variants(
-        heatmap_lattice, centers, latent_coords, mean_freqs,
-        scatter_size, scatter_alpha,
+        heatmap_lattice, centers,
         save_path=os.path.join(save_dir, 'figure_H_watershed_grid.png'),
     )
 
@@ -1531,7 +1777,6 @@ def analyze_mouse_latents(
 
     xx = np.linspace(0, 1, res)
     yy = np.linspace(0, 1, res)
-    sort_idx_freq = np.argsort(mean_freqs)
     boundary_levels = np.arange(0.5, n_clusters_found + 1.5)
 
     import matplotlib.gridspec as gridspec
@@ -1604,31 +1849,32 @@ def analyze_mouse_latents(
         fig = plt.figure(figsize=(6 + n_cols_h * 1.6, max(6, n_rows_h * 1.6 + 1)))
         outer = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[1, 1.05], wspace=0.15)
 
-        # --- Left: watershed segmentation, current cluster highlighted ---
+        # --- Left: the posterior this cluster was carved out of, boundaries on top ---
+        # This panel used to be a mean-frequency scatter, which showed where samples
+        # landed but not the density the watershed actually cut. It now draws the
+        # same aggregated posterior as Figures E and FG, so a basin can be checked
+        # against the mass it claims.
         ax_l = fig.add_subplot(outer[0, 0])
-        ax_l.scatter(latent_coords[sort_idx_freq, 0], latent_coords[sort_idx_freq, 1],
-                     c=mean_freqs[sort_idx_freq], cmap='magma',
-                     s=scatter_size, alpha=scatter_alpha,
-                     rasterized=True, linewidth=0, 
-                     marker='.', edgecolors='none')
+        # heatmap_lattice, not heatmap: this panel exists to show the basin the
+        # watershed cut, so it draws the field the watershed was run on. The two
+        # estimators of the posterior agree closely; Figures E and FG use the
+        # sample-space one because they are drawn against per-sample points.
+        draw_posterior_density(ax_l, heatmap_lattice, title=None, colorbar=False)
         ax_l.contour(xx, yy, ws_labels, levels=boundary_levels,
-                     colors='black', linewidths=1.5)
+                     colors=OVERLAY_COLOR, linewidths=1.0)
         ax_l.contour(xx, yy, (ws_labels == ci + 1).astype(int), levels=[0.5],
-                     colors='red', linewidths=3.0)
+                     colors=HIGHLIGHT_COLOR, linewidths=2.5)
         ax_l.scatter(centers[:, 0], centers[:, 1],
-                     c='black', s=60, marker='x', linewidths=1.5, zorder=9)
+                     c=OVERLAY_COLOR, s=50, marker='x', linewidths=1.2, zorder=9)
         ax_l.scatter([centers[ci, 0]], [centers[ci, 1]],
-                     c='red', s=120, marker='x', linewidths=2.5, zorder=10)
+                     c=HIGHLIGHT_COLOR, s=120, marker='x', linewidths=2.5, zorder=10)
         if len(picks) > 0:
             for k, pidx in enumerate(picks):
                 ax_l.text(latent_coords[pidx, 0], latent_coords[pidx, 1], str(k + 1),
-                          color='black', fontsize=7, fontweight='bold',
+                          color=HIGHLIGHT_COLOR, fontsize=7, fontweight='bold',
                           ha='center', va='center', zorder=12)
-        ax_l.set_xlim(0, 1); ax_l.set_ylim(0, 1); ax_l.set_aspect('equal')
-        ax_l.set_xlabel('Latent dimension 1', fontsize=11)
-        ax_l.set_ylabel('Latent dimension 2', fontsize=11)
         ax_l.set_title(f'Cluster {ci + 1} (σ=3, compact=0)',
-                       fontsize=12, fontweight='bold', color='red')
+                       fontsize=12, fontweight='bold', color=HIGHLIGHT_COLOR)
 
         # --- Right: tile-sampled spectrograms ---
         right_gs = gridspec.GridSpecFromSubplotSpec(
@@ -1638,7 +1884,7 @@ def analyze_mouse_latents(
             ax_s = fig.add_subplot(right_gs[rr, cc])
             if j < len(picks):
                 spec = full_ds[picks[j]][0].numpy().squeeze()
-                ax_s.imshow(spec, cmap='viridis', origin='lower', aspect='auto')
+                ax_s.imshow(spec, cmap=CMAP_SPEC, origin='lower', aspect='auto')
                 ax_s.set_title(str(j + 1), fontsize=8, color='black', pad=1)
                 for spine in ax_s.spines.values():
                     spine.set_visible(False)

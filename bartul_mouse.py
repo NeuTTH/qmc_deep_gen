@@ -23,7 +23,7 @@ Usage (fire CLI)::
     python bartul_mouse.py <save_location> <dataloc> \
         --nEpochs=300 --latent_dim=2 --lattice_type=korobov --korobov_a=76
 
-    # 3D latent space writes a multi-file grid instead of a single PNG
+    # 3D latent space
     python bartul_mouse.py <save_location> <dataloc> --latent_dim=3
 
 ``save_location`` and ``dataloc`` are required positional arguments; every
@@ -35,8 +35,7 @@ Star-import provenance (names used in this module):
     * ``nn``, ``QMCLVM``, ``TorusBasis``            -> models.qmc_base
     * ``gen_korobov_basis``, ``roberts_sequence``,
       ``gen_fib_basis``                             -> models.sampling
-    * ``plt``, ``format_plot_axis``,
-      ``model_grid_plot``                           -> plotting.visualize
+    * ``plt``                                       -> plotting.visualize
 The original wildcard imports have been made explicit below.
 """
 
@@ -63,8 +62,8 @@ import train.train as train_qmc
 
 # --- local: data / plotting ---
 from data.mouse_data import load_mouse_data, mouse_data
-from plotting.visualize import format_plot_axis, model_grid_plot, plt
-from plotting.visualize_3d import model_grid_plot as model_grid_plot_3d
+from plotting.visualize import plt
+from plotting.figstyle import TRAIN_COLOR, VAL_COLOR
 
 
 # ---------------------------------------------------------------------------
@@ -138,64 +137,49 @@ def compute_val_diagnostics(model, val_dataset, base_sequence, lp_fnc, device, i
 # ---------------------------------------------------------------------------
 def _save_diagnostic_plots(
     save_location, qmc_losses, val_loss_epochs, val_losses,
-    diag_epochs, diag_mse, val_diag_ml, val_diag_dur, dur_bin_edges,
 ):
-    """Write all three diagnostic plots to save_location, overwriting any existing files.
+    """Write the single training-stats figure, overwriting any existing file.
 
-    Plots: (1) train/val log-evidence over update number
-    (``qmc_train_stats.png``); (2) mean val MSE per ``masks_len`` group over
-    epochs (``qmc_val_mse_by_masks_len.png``); (3) mean val MSE per duration
-    bin over epochs (``qmc_val_mse_by_duration.png``). The MSE plots are
-    skipped until at least one diagnostic checkpoint exists.
+    One figure, ``qmc_train_stats`` in both .png and .svg, carrying the train and
+    the val log-evidence trace together. It used to be three files that had to be
+    read against each other: a .png with train and val, a .svg written at the end
+    of the run with train only, and two val-MSE-per-group plots whose lines were
+    flat from the first checkpoint and never separated a run from any other. The
+    per-group MSE numbers are still written to ``qmc_val_diagnostics.npz``, which
+    is what the model cards and the cross-run comparisons read.
+
+    The y-axis is clipped to the settled range: the first few updates sit thousands
+    of nats below everything that follows, and left unclipped they flattened the
+    whole curve against the top of the axes.
     """
-    # --- loss plot ---
-    fig, ax = plt.subplots()
-    ax.plot(-np.array(qmc_losses), label="train", alpha=0.8, color="tab:blue")
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    train_ev = -np.asarray(qmc_losses, dtype=float)
+    ax.plot(train_ev, label="train", alpha=0.8, color=TRAIN_COLOR, linewidth=0.8)
     if val_losses:
-        n_batches = len(qmc_losses) // val_loss_epochs[-1]
+        n_batches = max(1, len(qmc_losses) // val_loss_epochs[-1])
         val_x = np.array(val_loss_epochs) * n_batches
-        ax.plot(val_x, val_losses, marker="o", markersize=4, label="val", color="tab:orange")
+        ax.plot(val_x, val_losses, marker="o", markersize=4, label="val",
+                color=VAL_COLOR)
+
+    # Ignore the first 1 % of updates when setting the range, then pad.
+    settled = train_ev[max(1, len(train_ev) // 100):]
+    if settled.size:
+        lo = float(np.min(settled))
+        hi = float(np.max(settled))
+        if val_losses:
+            lo = min(lo, float(np.min(val_losses)))
+            hi = max(hi, float(np.max(val_losses)))
+        pad = 0.08 * max(hi - lo, 1e-6)
+        ax.set_ylim(lo - pad, hi + pad)
+
     ax.set_xlabel("update number")
     ax.set_ylabel("log evidence")
+    ax.set_title("Training and validation log evidence", fontweight="bold")
     ax.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_location, "qmc_train_stats.png"))
-    plt.close()
-
-    if not diag_epochs:
-        return
-
-    epochs_arr = np.array(diag_epochs)
-    mse_mat = np.array(diag_mse)  # (n_checkpoints, n_diag_samples)
-
-    # --- MSE by masks_len ---
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for ml in sorted(np.unique(val_diag_ml)):
-        mask = val_diag_ml == ml
-        mean_mse = [mse_mat[t][mask].mean() if mask.any() else np.nan for t in range(len(epochs_arr))]
-        ax.plot(epochs_arr, mean_mse, marker="o", markersize=3, label=f"masks_len={int(ml)}")
-    ax.set_xlabel("epoch")
-    ax.set_ylabel("mean MSE")
-    ax.set_title("Val MSE by masks_len across training")
-    ax.legend(fontsize=8, ncol=2)
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_location, "qmc_val_mse_by_masks_len.png"))
-    plt.close()
-
-    # --- MSE by duration bin ---
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for b in range(len(dur_bin_edges) - 1):
-        lo, hi = dur_bin_edges[b], dur_bin_edges[b + 1]
-        in_bin = (val_diag_dur >= lo) & (val_diag_dur < hi)
-        mean_mse = [mse_mat[t][in_bin].mean() if in_bin.any() else np.nan for t in range(len(epochs_arr))]
-        ax.plot(epochs_arr, mean_mse, marker="o", markersize=3, label=f"dur [{lo:.0f}, {hi:.0f})")
-    ax.set_xlabel("epoch")
-    ax.set_ylabel("mean MSE")
-    ax.set_title("Val MSE by duration bin across training")
-    ax.legend(fontsize=8, ncol=2)
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_location, "qmc_val_mse_by_duration.png"))
-    plt.close()
+    fig.tight_layout()
+    for ext in ("png", "svg"):
+        fig.savefig(os.path.join(save_location, f"qmc_train_stats.{ext}"))
+    plt.close(fig)
 
 
 def precompute_round_trip_indices(dataset, n_per_mask=10, seed=42):
@@ -367,6 +351,7 @@ def run_mouse_experiments(
     sampling_strategy="mask_duration",
     total_samples=None,
     duration_aware=False,
+    apply_mask=None,
 ):
     """Train (or reload) a QMCLVM on mouse spectrograms and render diagnostics.
 
@@ -382,8 +367,7 @@ def run_mouse_experiments(
         train_grid_m, test_grid_m: Fibonacci lattice order (used only when
             ``lattice_type`` is neither korobov nor roberts; 2D only).
         latent_dim: latent dimensionality (decoder input is ``2*latent_dim``
-            via TorusBasis). ``latent_dim=3`` writes a multi-file grid instead
-            of a single ``qmc_grid.png``.
+            via TorusBasis).
         lattice_type: "korobov" | "roberts" | other (-> Fibonacci).
         korobov_a: Korobov generating integer (only used for korobov lattices).
         train_n_points, test_n_points: lattice sizes for korobov/roberts.
@@ -392,6 +376,10 @@ def run_mouse_experiments(
     Training / data args:
         samples_per_mask, total_samples, duration_aware, sampling_strategy,
         filter_mask, lo, hi: forwarded to ``mouse_data`` for the train set.
+        apply_mask: override whether spectrograms are multiplied by their mask.
+            Leave None to let the dataset decide (sets built by
+            build-qlvm-training-set declare it; older sets are masked).
+            The effective value is recorded in ``sampling_config.json``.
         train_batch_size, test_batch_size, num_workers: DataLoader settings
             (``num_workers`` defaults to the CPU affinity count).
         print_gpu_mem: if True, print a compact per-epoch GPU-memory line.
@@ -402,7 +390,8 @@ def run_mouse_experiments(
             cadence of every 40 epochs.
         test_samples_per_mask: cap on val samples drawn per ``masks_len`` bin
             for the diagnostic subset.
-        n_dur_bins: number of duration percentile bins for the MSE-by-duration plot.
+        n_dur_bins: number of duration percentile bins recorded in
+            ``qmc_val_diagnostics.npz`` (``dur_bin_edges``).
 
     Seeding args:
         seed: dataset / round-trip RNG seed (``mouse_data`` uses ``seed``).
@@ -411,10 +400,9 @@ def run_mouse_experiments(
     Side effects (artifacts written to ``save_location``):
         sampling_config.json, qmc_train_mouse_experiment.tar,
         qmc_val_diagnostics.npz, qmc_train_stats.png, qmc_train_stats.svg,
-        qmc_val_mse_by_masks_len.png, qmc_val_mse_by_duration.png,
-        qmc_round_trips_val_<epoch>.png, qmc_round_trips_train.png,
-        qmc_round_trips_val.png, and qmc_grid.png (or a multi-file qmc_grid
-        directory when ``latent_dim == 3``).
+        qmc_round_trips_val_<epoch>.png, qmc_round_trips_train.png and
+        qmc_round_trips_val.png. The latent-decode grid is written by
+        ``analyze_mouse_latents_2d.py`` as ``figure_grid_examples.png``.
     """
     # --- seeding: model_seed governs model init RNG; mouse_data uses `seed` ---
     if model_seed is None:
@@ -436,9 +424,11 @@ def run_mouse_experiments(
         samples_per_mask=samples_per_mask,
         total_samples=total_samples,
         duration_aware=duration_aware,
+        apply_mask=apply_mask,
         seed=seed,
     )
-    test_ds = mouse_data(val_dict, filter_mask=filter_mask, lo=lo, hi=hi, seed=seed)
+    test_ds = mouse_data(val_dict, filter_mask=filter_mask, lo=lo, hi=hi,
+                         apply_mask=apply_mask, seed=seed)
     json.dump(train_ds.sampling_config,
               open(os.path.join(save_location, 'sampling_config.json'), 'w'), indent=2)
     n_workers = num_workers if num_workers is not None else len(os.sched_getaffinity(0))
@@ -545,7 +535,6 @@ def run_mouse_experiments(
 
                 _save_diagnostic_plots(
                     save_location, qmc_losses, val_loss_epochs, val_losses,
-                    diag_epochs, diag_mse, val_diag_ml, val_diag_dur, dur_bin_edges,
                 )
 
             # round-trip panels on a fixed cadence of every 40 epochs
@@ -576,34 +565,27 @@ def run_mouse_experiments(
     else:
         qmc_opt = Adam(qmc_model.parameters(), lr=1e-3)
         qmc_model, qmc_opt, qmc_losses = load(qmc_model, qmc_opt, save_qmc)
+        val_loss_epochs, val_losses = [], []
         print_gpu_memory("after model load")
 
-    # --- final plots: SVG loss curve, latent grid, and train/val round-trips ---
+    # --- final plots: the merged loss figure and the train/val round-trips ---
+    #
+    # No latent-decode grid here any more. It was written twice per run, once as
+    # `qmc_grid.png` by plotting.visualize.model_grid_plot and once as
+    # `figure_grid_examples.png` by analyze_mouse_latents_2d.grid_examples. The
+    # inference-side one is kept: it places the samples on torus cell centres
+    # (`linspace(0, 1, n, endpoint=False) + 0.5/n`) rather than sampling the wrapped
+    # edge twice, orients row 0 at the bottom to match every other latent panel, and
+    # takes a conditioning vector. The training-side one is gone.
     qmc_losses = np.array(qmc_losses)
-    ax = plt.gca()
-    ax.plot(-qmc_losses)
-    ax = format_plot_axis(
-        ax,
-        ylabel="log evidence",
-        xlabel="update number",
-        xticks=ax.get_xticks(),
-        yticks=ax.get_yticks(),
-    )
-    plt.savefig(os.path.join(save_location, "qmc_train_stats.svg"))
-    plt.close()
 
-    # 3D latent: use the 3D grid plotter writing a multi-file "qmc_grid" set;
-    # otherwise a single "qmc_grid.png".
-    _grid_plot_fn = model_grid_plot_3d if qmc_latent_dim == 3 else model_grid_plot
-    _grid_fn = os.path.join(save_location, "qmc_grid") if qmc_latent_dim == 3 else os.path.join(save_location, "qmc_grid.png")
-    _grid_plot_fn(
-        qmc_model.to(device),
-        n_samples_dim=20,
-        show=False,
-        fn=_grid_fn,
-        origin="lower",
-        cm="viridis",
-    )
+    # On the reload path the val trace is not in scope; recover it from the run's own
+    # diagnostics file so a regenerated figure is the same figure, not a train-only one.
+    if not val_losses and os.path.isfile(save_diag):
+        _diag = np.load(save_diag)
+        val_loss_epochs = _diag["val_loss_epochs"].tolist()
+        val_losses = _diag["val_losses"].tolist()
+    _save_diagnostic_plots(save_location, qmc_losses, val_loss_epochs, val_losses)
 
     _save_round_trip_panel(
         train_ds, qmc_model, test_base_sequence.to(device), lp_fnc, device,
