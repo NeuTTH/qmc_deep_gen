@@ -30,6 +30,15 @@ WHAT THE WRAPPER ADDS
      "all sessions". :func:`check_full_corpus` requires a ``full_data`` file and,
      when the build's ``metadata.npz`` is present, that it was built with
      ``full_dataset=True`` and an all-take-all ``session_type_targets``.
+   * rebuilding a CONDITIONAL decoder at the wrong input width. ``conditional``
+     widens the decoder's first linear layer by ``c_dim``, so passing the wrong
+     name -- or none at all, against a model that was trained with one -- builds a
+     different architecture and then tries to load a checkpoint into it.
+     :func:`check_conditional` compares the requested conditioning against the
+     run's own ``run_config.json``. The trap it exists for is the mask-count
+     width: that one-hot was 8 classes until the 5-class (1/2/3/4/5+) build
+     landed, so an April-2025 checkpoint needs ``mask_count8`` and a recent one
+     needs ``mask_count``, and the two differ by nothing a reader would notice.
    * a set whose ``session_type`` column is all ``'unknown'`` -- what the builder
      writes when ``session_type_targets`` is empty, which also silently disables
      ``require_mask``. That set drops the session-type panel out of
@@ -74,6 +83,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from analyze_mouse_latents_2d import analyze_mouse_latents  # noqa: E402
+from data import conditionals  # noqa: E402
 
 
 # The four labels the session-type panel of figure_E_embedded_grid draws. A
@@ -291,6 +301,198 @@ def check_arm(metadata, run_record):
     return {"problems": problems, "notes": notes, "data_arm": data_arm, "model_arm": model_arm}
 
 
+def _recorded_c_dim(run_config):
+    """The conditioning width the run record claims, or None if unknowable.
+
+    ``c_dim`` is written explicitly by the conditional driver; for a record that
+    predates that field it is re-derived from the recorded NAME. A name the
+    registry no longer knows (renamed, or a typo in a hand-written record) gives
+    None rather than raising -- the caller reports that as a mismatch it cannot
+    quantify, which is more useful than a traceback out of the preflight.
+    """
+    if run_config.get("c_dim") is not None:
+        return int(run_config["c_dim"])
+    try:
+        return conditionals.c_dim_of(run_config.get("conditional"))
+    except ValueError:
+        return None
+
+
+def _recorded_mask_count_classes(run_record):
+    """The slot-5 one-hot width the run built, and which file said so.
+
+    ``sampling_config.json`` wins for the same reason it wins in
+    :func:`model_apply_mask`: ``mouse_data`` writes its own RESOLVED
+    ``mask_count_classes`` there, whereas ``run_config.json`` records what the
+    driver asked for. They agree on anything the current driver wrote; on older
+    or hand-run checkpoints only one of them exists, and on none of them before
+    the 5-class build does either.
+    """
+    sampling = run_record.get("sampling_config") or {}
+    if sampling.get("mask_count_classes") is not None:
+        return int(sampling["mask_count_classes"]), "sampling_config.json"
+    run_config = run_record.get("run_config") or {}
+    if run_config.get("mask_count_classes") is not None:
+        return int(run_config["mask_count_classes"]), "run_config.json"
+    return None, None
+
+
+def _same_field_key_at(cond_name, c_dim):
+    """A registry name for the same field at width ``c_dim``, if one exists.
+
+    Today this only ever finds the mask-count pair: ``mask_count`` (5) and
+    ``mask_count8`` (8) both read slot 5 of the dataset tuple and differ only in
+    the one-hot width. Finding it turns a "these widths disagree" message into a
+    "pass ``mask_count8``" instruction, which is the actual fix.
+    """
+    try:
+        field = conditionals.resolve(cond_name)["field_idx"]
+    except ValueError:
+        return None
+    for name, entry in conditionals.CONDITIONAL_REGISTRY.items():
+        if name != cond_name and entry["field_idx"] == field and int(entry["c_dim"]) == int(c_dim):
+            return name
+    return None
+
+
+def check_conditional(run_record, conditional, strict=True):
+    """Refuse to rebuild a conditional decoder at the wrong input width.
+
+    ``analyze_mouse_latents`` reconstructs the architecture from scratch and then
+    loads the checkpoint into it; the only thing that tells it how wide the
+    decoder's first layer is, is the ``conditional`` argument. So this is the same
+    class of silent mistake as :func:`check_arm`: nothing about the checkpoint
+    file announces that it was trained with conditioning, and the failure modes
+    are a confusing size error at load time or -- when the widths happen to be
+    compatible -- a model that runs and produces figures of nothing.
+
+    The four ways to get it wrong, all treated as problems:
+
+    * the model was trained conditional and none was requested (the decoder comes
+      out ``c_dim`` inputs too narrow);
+    * the model was trained unconditional and a conditional was requested (too
+      wide);
+    * both conditional, but on DIFFERENT variables;
+    * both conditional on the same variable, but at different widths. This is the
+      mask-count trap: the one-hot was 8 classes through April 2025 and is 5
+      (1/2/3/4/5+) now, so the same name means two different decoders depending on
+      when the checkpoint was trained. The message names ``mask_count8`` when that
+      is what the record implies.
+
+    An absent record is NOT a problem by itself: hand-run checkpoints and every
+    run predating the conditional driver have no ``conditional`` key, and every
+    full-corpus run so far is unconditional, so refusing them would break the
+    ordinary path. It only becomes a problem when a conditional was REQUESTED
+    against an unverifiable record, which is when the width is a guess -- and
+    then only under ``strict``, matching how :func:`check_full_corpus` downgrades
+    a missing ``metadata.npz``.
+
+    Returns the usual ``{"notes", "problems"}`` report plus the resolved
+    ``conditional`` / ``c_dim`` for the manifest, and ``mask_count_classes``: the
+    slot-5 one-hot width the run recorded, so the dataset built here can be built
+    at the same width rather than at whatever ``mouse_data`` currently defaults to.
+    """
+    problems, notes = [], []
+    run_config = run_record.get("run_config") or {}
+
+    # Raises with the full list of valid names for an unknown one; returns 0 for
+    # None, which is exactly the unconditional decoder's extra input width.
+    requested_dim = conditionals.c_dim_of(conditional)
+    notes.append(f"requested conditioning: {conditionals.describe(conditional)}")
+
+    recorded_classes, classes_source = _recorded_mask_count_classes(run_record)
+    report = {"problems": problems, "notes": notes,
+              "conditional": conditional, "c_dim": requested_dim,
+              "mask_count_classes": recorded_classes}
+
+    if "conditional" not in run_config:
+        notes.append(
+            "run_config.json does not record 'conditional' (no record, or a run "
+            "predating the conditional driver); the conditioning cannot be "
+            "cross-checked here"
+        )
+        if conditional is not None and strict:
+            problems.append(
+                f"conditional={conditional!r} was requested but "
+                f"{os.path.join(run_record.get('run_dir', '?'), 'run_config.json')} does "
+                f"not record what the model was trained with, so the decoder width "
+                f"(2*latent_dim + {requested_dim}) is a guess and a wrong guess is not "
+                f"recoverable. Pass strict=False to embed anyway."
+            )
+        return report
+
+    trained = run_config.get("conditional")
+    trained_dim = _recorded_c_dim(run_config)
+
+    if trained is None and conditional is None:
+        notes.append("model trained unconditional (run_config.json: conditional=null)")
+    elif trained is not None and conditional is None:
+        problems.append(
+            f"CONDITIONING MISMATCH: the model was trained with conditional={trained!r} "
+            f"(c_dim={trained_dim}) but no conditional was passed. The decoder's first "
+            f"layer would be rebuilt {trained_dim} inputs too narrow, so the checkpoint "
+            f"either refuses to load or loads into the wrong architecture. Pass "
+            f"conditional={trained!r}."
+        )
+    elif trained is None and conditional is not None:
+        problems.append(
+            f"CONDITIONING MISMATCH: the model was trained UNCONDITIONAL "
+            f"(run_config.json: conditional=null) but conditional={conditional!r} was "
+            f"requested, which widens the decoder's first layer by {requested_dim}. "
+            f"Pass conditional=None."
+        )
+    elif trained != conditional:
+        problems.append(
+            f"CONDITIONING MISMATCH: the model was trained on {trained!r} "
+            f"(c_dim={trained_dim}) but {conditional!r} (c_dim={requested_dim}) was "
+            f"requested. Even at equal widths these are different variables and the "
+            f"figures would be conditioned on the wrong one. Pass "
+            f"conditional={trained!r}."
+        )
+    elif trained_dim is None:
+        notes.append(f"conditioning name matches ({conditional!r}) but the run record "
+                     f"carries no c_dim to check the width against")
+    elif int(trained_dim) != int(requested_dim):
+        alternative = _same_field_key_at(conditional, trained_dim)
+        fix = (f"Pass conditional={alternative!r}: same variable, c_dim={trained_dim}."
+               if alternative else
+               f"The registry has no {conditional!r} variant at c_dim={trained_dim}.")
+        problems.append(
+            f"CONDITIONING WIDTH MISMATCH: the model was trained on {conditional!r} at "
+            f"c_dim={trained_dim}, but {conditional!r} is c_dim={requested_dim} in the "
+            f"current registry. The name is the same and the decoder is not. {fix}"
+        )
+    else:
+        notes.append(f"conditioning matches the run record: {conditional!r} "
+                     f"(c_dim={requested_dim})")
+
+    # The slot-5 one-hot width is a property of the DATASET, not of the checkpoint,
+    # so a mask-count model needs the inference set built the same way the training
+    # set was or the decoder is fed a vector of the wrong length. Only the
+    # mask-count conditionals read slot 5; for anything else the width is recorded
+    # for provenance and forwarded unchanged.
+    if recorded_classes is not None:
+        notes.append(f"run record built slot 5 as a {int(recorded_classes)}-class "
+                     f"one-hot (from {classes_source})")
+        if conditional is not None:
+            try:
+                reads_slot5 = conditionals.resolve(conditional)["field_idx"] == 5
+            except ValueError:                           # already reported above
+                reads_slot5 = False
+            wanted = conditionals.mask_count_classes_for(conditional)
+            if reads_slot5 and int(recorded_classes) != int(wanted):
+                alternative = _same_field_key_at(conditional, recorded_classes)
+                fix = (f"Pass conditional={alternative!r}."
+                       if alternative else
+                       f"No registry entry builds a {int(recorded_classes)}-class one-hot.")
+                problems.append(
+                    f"MASK-COUNT WIDTH MISMATCH: the training set built slot 5 as a "
+                    f"{int(recorded_classes)}-class one-hot, but conditional="
+                    f"{conditional!r} asks mouse_data for {wanted} classes. {fix}"
+                )
+    return report
+
+
 def _git_commit(path):
     try:
         return subprocess.run(
@@ -346,6 +548,8 @@ def analyze_all_sessions(
     compute_recon=True,
     n_dur_bins=5,
     filter_mask=False,
+    # --- conditioning: must match what the checkpoint was trained with ---
+    conditional=None,
     **analyze_kwargs,
 ):
     """Embed every spectrogram in the full session corpus and write the figure set.
@@ -386,6 +590,18 @@ def analyze_all_sessions(
         n_dur_bins: Duration quantile bins in the MSE bar chart.
         filter_mask: Leave False. The shipped [1,8] mask-count filter would drop
             the open-ended top stratum of the corpus.
+        conditional: The conditioning variable the CHECKPOINT was trained with --
+            a key of ``data.conditionals`` ("duration", "mean_freq", "mask_count",
+            "mask_count8") -- or None for an unconditional model. Default None
+            because every full-corpus run to date is unconditional, and because
+            this is the one analysis argument that changes the ARCHITECTURE rather
+            than the figures: ``c_dim`` widens the decoder's first linear layer, so
+            a wrong value does not produce a worse embedding, it produces a decoder
+            the checkpoint does not fit. :func:`check_conditional` cross-checks it
+            against the run's own ``run_config.json`` before anything is loaded.
+            Note that the mask-count one-hot changed width -- checkpoints trained
+            before the 5-class (1/2/3/4/5+) build need "mask_count8", not
+            "mask_count".
         **analyze_kwargs: Anything else ``analyze_mouse_latents`` takes
             (``scatter_size``, ``scatter_alpha``, ``beh_features_path``,
             ``recon_batch_size``, ``ms_*``, ...). ``apply_mask`` and
@@ -405,6 +621,11 @@ def analyze_all_sessions(
         if banned in analyze_kwargs:
             raise ValueError(f"analyze_all_sessions refuses {banned!r}: {why}.")
 
+    # Fail on an unknown conditioning name here rather than several minutes into a
+    # corpus load. resolve() raises with the list of valid names.
+    if conditional is not None:
+        conditionals.resolve(conditional)
+
     model_path = os.path.abspath(model_path)
     dataloc = os.path.abspath(dataloc)
     save_dir = os.path.abspath(save_dir)
@@ -419,14 +640,15 @@ def analyze_all_sessions(
     run_record = read_run_record(model_path)
     corpus = check_full_corpus(dataloc, metadata, min_n=min_n, strict=strict)
     arm = check_arm(metadata, run_record)
+    cond = check_conditional(run_record, conditional, strict=strict)
 
     print("=== analyze_all_sessions preflight ===")
     print(f"  model    : {model_path}")
     print(f"  dataloc  : {dataloc}")
     print(f"  save_dir : {save_dir}")
-    for note in corpus["notes"] + arm["notes"]:
+    for note in corpus["notes"] + arm["notes"] + cond["notes"]:
         print(f"  ok       : {note}")
-    problems = corpus["problems"] + arm["problems"]
+    problems = corpus["problems"] + arm["problems"] + cond["problems"]
     for problem in problems:
         print(f"  PROBLEM  : {problem}")
     if problems:
@@ -441,8 +663,16 @@ def analyze_all_sessions(
         grid_size=grid_size, n_per_cluster=n_per_cluster,
         sample_from_centroid=sample_from_centroid, cache_posteriors=cache_posteriors,
         use_fast_mean_shift=use_fast_mean_shift, compute_recon=compute_recon,
-        n_dur_bins=n_dur_bins, filter_mask=filter_mask, **analyze_kwargs,
+        n_dur_bins=n_dur_bins, filter_mask=filter_mask, conditional=conditional,
+        **analyze_kwargs,
     )
+    # Reproduce the slot-5 one-hot width the training set was built with, so the
+    # conditioning vector this run feeds the decoder is the length it was trained
+    # on. Only forwarded when the run actually recorded a width and the caller did
+    # not pin one: left out, analyze_mouse_latents derives it from `conditional`
+    # and mouse_data keeps its own default, which is the pre-existing behaviour.
+    if cond["mask_count_classes"] is not None and "mask_count_classes" not in analyze_kwargs:
+        settings["mask_count_classes"] = int(cond["mask_count_classes"])
     if dry_run:
         print("dry_run=True; settings that WOULD be used:")
         print(json.dumps(settings, indent=2, default=str))
@@ -482,6 +712,11 @@ def analyze_all_sessions(
             "run_config": run_record["run_config"],
             "sampling_config": run_record["sampling_config"],
             "trained_apply_mask": arm["model_arm"],
+            # The conditioning the decoder was actually rebuilt with. Recorded
+            # beside trained_apply_mask because it is the same kind of fact: not a
+            # figure setting but a statement about which model this figure set is of.
+            "conditional": cond["conditional"],
+            "c_dim": cond["c_dim"],
         },
         "dataset": {
             "path": dataloc,

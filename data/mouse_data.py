@@ -1,4 +1,4 @@
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from torchvision import transforms
 import torch
 import os,glob
@@ -6,6 +6,8 @@ import h5py
 from sklearn.model_selection import train_test_split
 import numpy as np
 from tqdm import tqdm 
+
+from data.conditionals import DEFAULT_MASK_COUNT_CLASSES
 
 def load_segmented_sylls(bird_filepath,sylls,test_size=0.2,seed=92):
 
@@ -353,7 +355,21 @@ class mouse_data(Dataset):
     self.sampling_config records the full configuration and result counts for
     reproducibility. self.seed stores the random seed used.
 
-    __getitem__ returns (spec, masks_len, duration, mask, spec_id) where spec is (1 x H x W).
+    __getitem__ returns an 8-tuple. The slot ORDER is load-bearing — every
+    consumer indexes it positionally, and data/conditionals.py maps conditional
+    names onto these indices — so fields may be added only at the end:
+
+        0: spec               (1 x H x W), min-max normalized, masked if apply_mask
+        1: masks_len          scalar
+        2: raw duration       scalar
+        3: norm_duration      scalar in [0, 1]
+        4: mean_freq          scalar in [0, 1]
+        5: mask_count_onehot  (K,), K = mask_count_classes
+        6: mask               (H x W), raw (not binarized)
+        7: spec_id            str
+
+    (This docstring long advertised a 5-tuple `(spec, masks_len, duration, mask,
+    spec_id)`, which stopped being true when the conditional fields were added.)
     """
 
     def __init__(self, data_dict,
@@ -367,6 +383,8 @@ class mouse_data(Dataset):
                  duration_aware=False,     # used by "subsample"
                  # Masking: None = ask the data (default True if it does not say)
                  apply_mask=None,
+                 # Width of the mask-count one-hot in slot 5 of __getitem__
+                 mask_count_classes=DEFAULT_MASK_COUNT_CLASSES,
                  seed=42):
         spectrograms = data_dict['spectrograms']
         masks        = data_dict['masks']
@@ -502,10 +520,19 @@ class mouse_data(Dataset):
         weighted_freq = (specs_f * freq_bins).sum(dim=(1, 2))                   # (N,)
         self.mean_freqs = (weighted_freq / energy) / H_freq                     # (N,) in [0, 1]
 
-        # One-hot mask count: 8 classes (masks_len 1–8 → indices 0–7)
-        ml_idx = self.masks_len.long().clamp(1, 8) - 1                          # (N,) in [0, 7]
-        self.mask_count_onehot = torch.zeros(len(ml_idx), 8)
-        self.mask_count_onehot.scatter_(1, ml_idx.unsqueeze(1), 1.0)            # (N, 8)
+        # One-hot mask count over K classes: masks_len 1..K-1 each get their own
+        # class and everything at or beyond K lumps into the top one, so the last
+        # class reads "K or more". K is an argument rather than a constant because
+        # it is the width of the conditioning vector the decoder is built for
+        # (data/conditionals.py owns the choice). A mismatch between the two is
+        # silent — the model still runs, it just conditions on a relabelled axis.
+        n_classes = int(mask_count_classes)
+        if n_classes < 1:
+            raise ValueError(f'mask_count_classes must be >= 1, got {mask_count_classes!r}')
+        ml_idx = self.masks_len.long().clamp(1, n_classes) - 1                  # (N,) in [0, K-1]
+        self.mask_count_classes = n_classes
+        self.mask_count_onehot = torch.zeros(len(ml_idx), n_classes)
+        self.mask_count_onehot.scatter_(1, ml_idx.unsqueeze(1), 1.0)            # (N, K)
 
         self.sampling_config = {
             'filter_mask':       filter_mask,
@@ -516,6 +543,7 @@ class mouse_data(Dataset):
             'total_samples':     total_samples,
             'duration_aware':    duration_aware,
             'apply_mask':        apply_mask,
+            'mask_count_classes': n_classes,
             'seed':              seed,
             'n_after_filter':    n_after_filter,
             'n_final':           len(self.spectrograms),
@@ -546,7 +574,7 @@ class mouse_data(Dataset):
             duration.float(),                  # 2: scalar (raw duration)
             self.norm_durations[index],        # 3: scalar (normalized duration)
             self.mean_freqs[index],            # 4: scalar (mean frequency)
-            self.mask_count_onehot[index],     # 5: (8,) one-hot mask count
+            self.mask_count_onehot[index],     # 5: (K,) one-hot mask count
             mask,                              # 6: H x W
             spec_id,                           # 7: str
         )
@@ -560,6 +588,113 @@ def print_masks_len_stats(masks_len, label=''):
     for u, c in zip(unique.tolist(), counts.tolist()):                                                                 
         print(f'{u:>10}  {c:>8}  {c/total*100:>7.1f}%')                                                                
     print(f'{"total":>10}  {total:>8}  100.0%')         
+
+
+class ConditionGroupedBatchSampler(Sampler):
+    """Yield batches whose rows all share one conditioning value.
+
+    WHY HOMOGENEITY IS REQUIRED (this is the whole point of the class).
+    The QMCLVM decodes ONE lattice per optimizer step conditioned on ONE ``c``:
+    ``QMCLVM.forward`` concatenates ``c.repeat(n_lattice, 1)`` onto the lattice
+    basis, and ``binary_evidence`` then marginalizes EVERY row of the batch over
+    that single stack of decoded images. One ``c`` per batch is structural, not a
+    shortcut -- a per-row ``c`` would need ``B x n_lattice`` decoder outputs
+    (512 x 610 x 128 x 128 floats, ~20 GB in a single forward).
+
+    That structure is exact when every row in the batch shares the ``c`` it is
+    scored against, and a fiction otherwise. With a plainly shuffled loader the
+    collate function had to average the per-row conditioning values, and the mean
+    of 512 shuffled one-hots is just the dataset marginal -- the same near-constant
+    vector at every step, carrying no information about the rows in the batch. The
+    April-2025 checkpoint trained that way moved its decoder output by 0.0031
+    (pixel std) across the eight mask-count one-hots versus 0.0191 across lattice
+    position: conditioning was ~6x weaker than latent position, i.e. ignored.
+
+    Grouping the rows instead makes the existing one-``c``-per-batch decode
+    correct rather than approximate, at exactly the cost of today's step. The
+    group id is supplied by ``data.conditionals.group_ids``: the class itself for
+    a discrete conditional, a quantile bin for a continuous one.
+
+    SHUFFLING IS TWO-LEVEL and both levels matter:
+      1. rows are shuffled inside their group, so batch membership varies by
+         epoch rather than freezing 512 spectrograms together for the whole run;
+      2. the resulting batches are shuffled ACROSS groups. Skipping this one is
+         catastrophic: the optimizer would see every batch of group 0, then every
+         batch of group 1, and so on -- a curriculum of one conditioning value at a
+         time, a worse pathology than the averaging it replaces.
+
+    Args:
+        group_ids: integer group id per dataset row, length ``len(dataset)``, as
+            returned by ``data.conditionals.group_ids``. Ids need not be
+            contiguous or sorted.
+        batch_size: rows per batch. A group smaller than this yields one short
+            batch, which is still homogeneous and therefore still correct.
+        shuffle: shuffle within groups and shuffle batch order. Pass False for a
+            fixed, reproducible pass (diagnostics), never for training.
+        drop_last: drop each group's trailing short batch. Default False, because
+            those batches are perfectly valid here and dropping them throws away
+            the tail of every group -- which hurts the small groups most, and the
+            small groups are the rare conditioning values the model most needs.
+        seed: base seed; epoch ``e`` draws from ``seed + e``, so successive epochs
+            differ while a whole run replays identically.
+
+    Yields lists of dataset indices, for ``DataLoader(batch_sampler=...)`` -- which
+    forbids passing ``batch_size`` / ``shuffle`` / ``drop_last`` alongside it.
+    """
+
+    def __init__(self, group_ids, batch_size, shuffle=True, drop_last=False, seed=42):
+        self.group_ids = np.asarray(group_ids).reshape(-1)
+        self.batch_size = int(batch_size)
+        if self.batch_size < 1:
+            raise ValueError(f'batch_size must be >= 1, got {batch_size!r}')
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        # Membership is fixed for the life of the sampler; only the order within a
+        # group and the order of the batches change from epoch to epoch.
+        self.group_indices = {
+            int(gid): np.where(self.group_ids == gid)[0]
+            for gid in np.unique(self.group_ids)
+        }
+
+        self._n_batches = sum(
+            len(idx) // self.batch_size if self.drop_last
+            else -(-len(idx) // self.batch_size)          # ceil division
+            for idx in self.group_indices.values()
+        )
+
+    def group_sizes(self):
+        """Row count per group, ordered by group id -- for startup logging."""
+        return np.array([len(self.group_indices[g]) for g in sorted(self.group_indices)])
+
+    def __iter__(self):
+        # The epoch counter lives here rather than in a set_epoch() the caller must
+        # remember to call: one DataLoader pass is one epoch by construction, and a
+        # forgotten set_epoch() would silently repeat the same batches forever.
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.epoch += 1
+
+        batches = []
+        for gid in sorted(self.group_indices):
+            idx = self.group_indices[gid]
+            if self.shuffle:
+                idx = rng.permutation(idx)
+            for start in range(0, len(idx), self.batch_size):
+                chunk = idx[start:start + self.batch_size]
+                if self.drop_last and len(chunk) < self.batch_size:
+                    continue
+                batches.append([int(i) for i in chunk])
+
+        if self.shuffle:
+            batches = [batches[i] for i in rng.permutation(len(batches))]
+
+        return iter(batches)
+
+    def __len__(self):
+        return self._n_batches
+
 
 
 #### song features from syllables

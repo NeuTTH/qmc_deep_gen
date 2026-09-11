@@ -27,6 +27,7 @@ from train.model_saving_loading import load
 from train.losses import binary_lp
 from torch.optim import Adam
 from data.mouse_data import load_full_mouse_data, load_mouse_data, mouse_data
+from data import conditionals
 from analysis.model_helpers import get_posterior_summaries, torus_forward, torus_reverse
 from analysis.clustering import run_mean_shift, run_mean_shift_fast
 from plotting.figstyle import (
@@ -40,23 +41,22 @@ from plotting.figstyle import (
 
 
 # ---------------------------------------------------------------------------
-# Conditional variable registry  (mirrors bartul_mouse_cond.py)
+# Conditional variable registry -- now owned by data/conditionals.py.
 #
-# mouse_data.__getitem__ returns:
-#   0: spec            (1 x H x W)
-#   1: masks_len       scalar float
-#   2: raw duration    scalar float
-#   3: norm_duration   scalar float  [0, 1]
-#   4: mean_freq       scalar float  [0, 1]
-#   5: mask_count_onehot  (8,) float
-#   6: mask            (H x W)
-#   7: spec_id         str
+# This module used to carry its own literal copy of the registry, as did
+# bartul_mouse_cond.py (training). They drifted, and the drift was silent in the
+# worst possible place: the mask-count one-hot width. Training moved to 5 classes
+# (1/2/3/4/5+) while this copy still said 8, and a width disagreement between the
+# script that trained the decoder and the script that rebuilds it does not raise
+# -- it builds nn.Linear(2*latent_dim + c_dim, ...) at the wrong input size and
+# either fails to load the state dict or, worse, loads something that runs.
+#
+# The alias below keeps the module-level name importable for anything that still
+# reads it; every lookup in this file now goes through the shared helpers
+# (conditionals.resolve / c_dim_of / describe / get_grid_sweep / sample_c), so
+# there is nothing left here to drift.
 # ---------------------------------------------------------------------------
-CONDITIONAL_REGISTRY = {
-    "mask_count": {"field_idx": 5, "c_dim": 8,  "label": "masks_len (one-hot)"},
-    "duration":   {"field_idx": 3, "c_dim": 1,  "label": "normalized duration"},
-    "mean_freq":  {"field_idx": 4, "c_dim": 1,  "label": "mean frequency"},
-}
+CONDITIONAL_REGISTRY = conditionals.CONDITIONAL_REGISTRY
 
 
 CONDITION_SUFFIX = {
@@ -110,7 +110,7 @@ def _make_c_fn(cond_name, device):
     """Return a callable ``c_fn(batch) -> Tensor (1, c_dim)`` for use with
     ``get_posterior_summaries``.  ``batch`` comes from the default DataLoader
     collate so each element is already a batched tensor."""
-    fi = CONDITIONAL_REGISTRY[cond_name]["field_idx"]
+    fi = conditionals.resolve(cond_name)["field_idx"]
 
     def c_fn(batch):
         vals = batch[fi].float()          # (B,) or (B, c_dim)
@@ -122,12 +122,13 @@ def _make_c_fn(cond_name, device):
 
 
 def _get_sample_c(dataset, index, cond_name, device):
-    """Extract the conditioning tensor for a single dataset sample → (1, c_dim)."""
-    fi = CONDITIONAL_REGISTRY[cond_name]["field_idx"]
-    val = dataset[index][fi].float()
-    if val.dim() == 0:
-        val = val.unsqueeze(0)    # scalar → (1,)
-    return val.unsqueeze(0).to(device)   # (1, c_dim)
+    """Extract the conditioning tensor for a single dataset sample → (1, c_dim).
+
+    Kept as a name because the call sites below read better for it; the body is
+    ``conditionals.sample_c``, so the conditional-to-tuple-slot mapping lives in
+    exactly one place.
+    """
+    return conditionals.sample_c(dataset, index, cond_name, device=device)
 
 
 def _style_latent_axis(ax, title=None, xlabel='Latent dimension 1',
@@ -987,7 +988,8 @@ def analyze_mouse_latents(
     ms_max_iter=300,
     ms_tol=1e-5,
     # conditional model support
-    conditional=None,   # one of: "mask_count", "duration", "mean_freq", or None
+    conditional=None,         # a data.conditionals key, or None for unconditional
+    mask_count_classes=None,  # slot-5 one-hot width; None = derive / dataset default
     # data filtering
     filter_mask=True,
     lo=1,
@@ -1023,10 +1025,21 @@ def analyze_mouse_latents(
             50=above-median local maxima. Higher = fewer seeds, faster, may miss shallow modes.
         ms_max_iter: Max iterations for fast mean-shift
         ms_tol: Convergence threshold relative to bandwidth (fast mean-shift only)
-        conditional: name of conditioning variable from CONDITIONAL_REGISTRY, or None for
-            unconditional models. When set the decoder's first linear layer is widened
-            by c_dim and conditioning tensors are extracted per-batch from the dataset.
-            Choices: "mask_count" (8-D one-hot), "duration" (scalar), "mean_freq" (scalar).
+        conditional: name of a conditioning variable from ``data.conditionals``
+            (the registry the training driver reads), or None for unconditional
+            models. When set the decoder's first linear layer is widened by c_dim
+            and conditioning tensors are extracted per-batch from the dataset.
+            Choices: "mask_count" (5-D one-hot, 1/2/3/4/5+), "mask_count8" (the
+            legacy 8-D width the April-2025 checkpoints were trained with),
+            "duration" (scalar), "mean_freq" (scalar). It MUST match what the
+            checkpoint was trained with -- c_dim sets the decoder's input width,
+            which is not something loading the state dict can silently fix.
+        mask_count_classes: one-hot width ``mouse_data`` builds for slot 5 of its
+            tuple. Leave None: for a mask-count conditional it is derived from
+            ``conditional`` (5 for "mask_count", 8 for "mask_count8") because that
+            width IS the decoder's c_dim, and otherwise the dataset keeps its own
+            default. Set it only to reproduce a run whose dataset was built with a
+            non-default width.
         apply_mask: Override whether spectrograms are multiplied by their mask.
             Leave None to let the dataset decide -- an unmasked set built with
             --no-apply-mask must be embedded unmasked, or the reconstruction
@@ -1044,14 +1057,22 @@ def analyze_mouse_latents(
     # Setup
     os.makedirs(save_dir, exist_ok=True)
 
-    if conditional is not None and conditional not in CONDITIONAL_REGISTRY:
-        raise ValueError(
-            f"Unknown conditional: {conditional!r}. "
-            f"Choose from: {list(CONDITIONAL_REGISTRY)} or None."
-        )
-    c_dim = CONDITIONAL_REGISTRY[conditional]["c_dim"] if conditional is not None else 0
+    # resolve() raises with the full list of valid names; c_dim_of() returns 0 for
+    # None, which is exactly the unconditional decoder's extra input width.
     if conditional is not None:
-        print(f"Conditional mode: {conditional!r}  ({CONDITIONAL_REGISTRY[conditional]['label']},  c_dim={c_dim})")
+        conditionals.resolve(conditional)
+    c_dim = conditionals.c_dim_of(conditional)
+    if conditional is not None:
+        print(f"Conditional mode: {conditionals.describe(conditional)}")
+
+    # A mask-count conditional feeds slot 5 of the dataset tuple straight into the
+    # decoder, so the one-hot width mouse_data builds IS c_dim. Derive it from the
+    # conditional rather than trusting the dataset default to agree: "mask_count"
+    # needs 5 and the legacy "mask_count8" needs 8, and a disagreement hands the
+    # decoder a vector of the wrong width instead of raising.
+    if mask_count_classes is None and conditional is not None:
+        if conditionals.resolve(conditional)["field_idx"] == 5:
+            mask_count_classes = conditionals.mask_count_classes_for(conditional)
 
     # Load behavioral features (session_id -> DataFrame)
     import pickle
@@ -1070,9 +1091,14 @@ def analyze_mouse_latents(
     # test_ds = mouse_data(train_dict, masks_len_range=(1, 8), equal_sampling=True, max_samples=max_samples)
     
     full_dict = load_full_mouse_data(dataloc)
+    # Pass mask_count_classes only when something actually asked for a width, so
+    # the unconditional path stays exactly the call it has always been.
+    ds_kwargs = ({} if mask_count_classes is None
+                 else {"mask_count_classes": int(mask_count_classes)})
     full_ds = mouse_data(full_dict, filter_mask=filter_mask, lo=lo, hi=hi,
                          apply_mask=apply_mask,
-                         sampling_strategy='subsample', total_samples=total_samples)
+                         sampling_strategy='subsample', total_samples=total_samples,
+                         **ds_kwargs)
 
     # Refine session_type from an experimental-condition table, before any figure
     # reads it. build-qlvm-training-set derives session_type from subject SEX alone
@@ -1783,8 +1809,10 @@ def analyze_mouse_latents(
     if conditional is not None:
         # For conditional models generate one grid per sweep value and also a
         # mean-c grid for a compact single overview.
-        from bartul_mouse_cond import get_grid_sweep
-        sweep = get_grid_sweep(conditional)
+        # From data.conditionals, NOT bartul_mouse_cond: the training driver's own
+        # copy of the sweep was the 8-class one, so a 5-class mask_count model got
+        # eight grids, three of them decoded from a c wider than the decoder's c_dim.
+        sweep = conditionals.get_grid_sweep(conditional)
         for val_label, c_val in sweep:
             grid_examples(
                 model, grid_size,
@@ -1792,7 +1820,7 @@ def analyze_mouse_latents(
                 device=device, c=c_val.to(device),
             )
         # Also produce a mean-conditioning overview grid
-        fi = CONDITIONAL_REGISTRY[conditional]["field_idx"]
+        fi = conditionals.resolve(conditional)["field_idx"]
         mean_c = torch.stack([
             full_ds[i][fi].float() if full_ds[i][fi].dim() > 0 else full_ds[i][fi].float().unsqueeze(0)
             for i in range(min(500, len(full_ds)))
