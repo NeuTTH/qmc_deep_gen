@@ -168,7 +168,9 @@ def check_full_corpus(dataloc, metadata, min_n=None, strict=True):
       fall back to concatenating a train/val DRAW otherwise;
     * the build says ``full_dataset=True`` and every ``session_type_targets``
       entry is null (take-all). A budgeted draw with a big N is still a draw;
-    * ``require_mask`` is on and ``masking_type == 'sam'``;
+    * ``require_mask`` is on and ``masking_type == 'sam'`` -- unless the build is
+      maskless (``masking_type == 'none'``), which the BBV corpora are, in which
+      case the requirement is instead that it does NOT ask for masking;
     * the ``session_type_by_key`` map is populated with real labels. An empty
       ``session_type_targets`` takes the builder's untyped path, which writes
       ``session_type='unknown'`` for every row (empty ``_cond`` figure) AND
@@ -217,11 +219,30 @@ def check_full_corpus(dataloc, metadata, min_n=None, strict=True):
             "--require-mask was ignored. Rebuild with an all-null mapping."
         )
 
-    if not bool(metadata.get("require_mask", False)):
-        problems.append("require_mask=False: rows the detector found no mask for carry an "
-                        "all-ones mask, which asserts the whole spectrogram is signal.")
-    if str(metadata.get("masking_type", "")) != "sam":
-        problems.append(f"masking_type={metadata.get('masking_type')!r}, expected 'sam'.")
+    # A MASKLESS corpus is a legitimate full corpus, not a misbuilt masked one. The
+    # broadband-vocalization builds have no SAM segmentation at all: masking_type is
+    # 'none', the stored mask plane is all zeros, require_mask is off because there was
+    # never a detector to require, and the set declares apply_mask=False. Treated as a
+    # masked build, these two gates reject every BBV corpus for the wrong reason.
+    #
+    # This is not a loosening of the masked case. A set that says masking_type='sam'
+    # still has to have require_mask on, which is the failure these lines were written
+    # to catch. And a maskless set that nonetheless asks for masking is caught here
+    # instead, because multiplying by an all-zero plane would zero every spectrogram.
+    if str(metadata.get("masking_type", "")) == "none":
+        if bool(metadata.get("apply_mask", True)):
+            problems.append("masking_type='none' but apply_mask is true: there are no masks "
+                            "to apply, and masking would zero every spectrogram.")
+        else:
+            notes.append("maskless corpus (masking_type='none', apply_mask=False); the "
+                         "in-mask / out-of-mask reconstruction split carries no meaning "
+                         "here -- read mean_recon_mse, not mse_in_mask")
+    else:
+        if not bool(metadata.get("require_mask", False)):
+            problems.append("require_mask=False: rows the detector found no mask for carry an "
+                            "all-ones mask, which asserts the whole spectrogram is signal.")
+        if str(metadata.get("masking_type", "")) != "sam":
+            problems.append(f"masking_type={metadata.get('masking_type')!r}, expected 'sam'.")
 
     types_by_key = metadata.get("session_type_by_key")
     if isinstance(types_by_key, dict) and types_by_key:

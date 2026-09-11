@@ -82,6 +82,8 @@ EMITTER_SEX_ORDER = ["female", "male"]
 CMAP_SPEC = "viridis"      # every spectrogram image, static or animated
 CMAP_POSTERIOR = "magma"   # aggregated-posterior density, every panel that shows it
 CMAP_FREQ = "viridis"      # mean frequency
+CMAP_BANDWIDTH = "plasma"  # spectral bandwidth -- deliberately not CMAP_FREQ, so the
+                           # two frequency-axis panels are not mistaken for each other
 CMAP_MASK_COUNT = "cividis"  # SAM mask count
 CMAP_DURATION = "magma"    # syllable duration
 CMAP_SOCIAL_DIST = "YlOrRd_r"  # social distance, near = light
@@ -93,6 +95,26 @@ HIGHLIGHT_COLOR = "#00E5FF"
 
 # Fixed range for social distance so every panel and every run shares a scale.
 SOCIAL_DIST_RANGE = (0, 85)
+
+# Fixed range for the SAM mask count colour scale. The distribution is heavily
+# skewed -- almost every syllable carries 1-3 masks and a thin tail runs past 20 --
+# so an autoscaled colorbar spends its whole range on samples that do not exist and
+# renders the bulk of the data as one flat colour. Clipping at 8 puts the contrast
+# where the samples are. Points above 8 are still drawn, saturated at the top
+# colour, never dropped.
+MASK_COUNT_RANGE = (1, 8)
+
+# The high-mask-count panel: the counts that get their own discrete colour, and
+# everything outside that set drawn in MISSING_COLOR behind them. Okabe-Ito hexes,
+# chosen to be colourblind-safe and to sit outside the seaborn-deep session-type
+# palette, so a high-mask panel is never read as a condition panel.
+HIGH_MASK_COUNTS = [4, 5, 6, 7]
+HIGH_MASK_COLORS = {
+    "4": "#E69F00",
+    "5": "#009E73",
+    "6": "#0072B2",
+    "7": "#CC79A7",
+}
 
 
 def bar_shades(cmap_name, n, lo=0.15, hi=0.85):

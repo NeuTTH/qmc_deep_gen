@@ -32,9 +32,10 @@ from analysis.clustering import run_mean_shift, run_mean_shift_fast
 from plotting.figstyle import (
     SESSION_TYPE_COLORS, SESSION_TYPE_ORDER, COND_COLORS, COND_ORDER,
     EMITTER_SEX_COLORS, EMITTER_SEX_ORDER, MISSING_COLOR,
-    CMAP_SPEC, CMAP_POSTERIOR, CMAP_FREQ, CMAP_MASK_COUNT, CMAP_DURATION,
-    CMAP_SOCIAL_DIST, CMAP_SEGMENT, OVERLAY_COLOR, HIGHLIGHT_COLOR,
-    SOCIAL_DIST_RANGE, session_type_color, bar_shades, scatter_params_for,
+    CMAP_SPEC, CMAP_POSTERIOR, CMAP_FREQ, CMAP_BANDWIDTH, CMAP_MASK_COUNT,
+    CMAP_DURATION, CMAP_SOCIAL_DIST, CMAP_SEGMENT, OVERLAY_COLOR, HIGHLIGHT_COLOR,
+    SOCIAL_DIST_RANGE, MASK_COUNT_RANGE, HIGH_MASK_COUNTS, HIGH_MASK_COLORS,
+    session_type_color, bar_shades, scatter_params_for,
 )
 
 
@@ -157,6 +158,7 @@ def draw_latent_scatter(
     scatter_alpha=0.4,
     title=None,
     colorbar=True,
+    missing_label='missing',
 ):
     """Draw one 2-D latent scatter onto an existing axis.
 
@@ -233,7 +235,8 @@ def draw_latent_scatter(
         if nan_mask.any():
             handles.append(mpl.lines.Line2D(
                 [], [], marker='o', linestyle='none', markersize=6,
-                color=MISSING_COLOR, label=f'missing (n={int(nan_mask.sum()):,})'))
+                color=MISSING_COLOR,
+                label=f'{missing_label} (n={int(nan_mask.sum()):,})'))
         ax.legend(handles=handles, fontsize=8, loc='upper right', framealpha=0.85)
 
     _style_latent_axis(ax, title=title)
@@ -962,7 +965,7 @@ def analyze_mouse_latents(
     lattice_m=20,
     bandwidth=0.1,
     batch_size=1,
-    freq_range_khz=(20, 120),
+    freq_range_khz=(30, 120),   # usv-playpen generate_spectrograms defaults
     scatter_size=5,
     scatter_alpha=0.2,
     total_samples=None,
@@ -1002,7 +1005,11 @@ def analyze_mouse_latents(
         lattice_m: Fibonacci lattice parameter (m=20 gives ~10K points)
         bandwidth: Bandwidth for mean-shift clustering
         batch_size: Batch size for data loading
-        freq_range_khz: (min, max) frequency range in kHz, e.g., (20, 120) for mouse USVs
+        freq_range_khz: (min, max) frequency range in kHz of the spectrogram's
+            frequency axis, used to convert mean frequency and bandwidth out of bin
+            units. Default (30, 120) matches usv-playpen's generate_spectrograms
+            min_freq/max_freq. Pass None to leave both in bins (the colorbars then
+            say 'bins' rather than 'kHz').
         scatter_size: Point size for scatter plot (default 3)
         scatter_alpha: Transparency for scatter plot (default 0.3)
         beh_features_path: Path to pkl with {session_id -> DataFrame(avg_social_distance, emitter_sex)}
@@ -1160,9 +1167,10 @@ def analyze_mouse_latents(
     print(f"Latent coords range AFTER mod: X=[{latent_coords[:, 0].min():.3f}, {latent_coords[:, 0].max():.3f}], Y=[{latent_coords[:, 1].min():.3f}, {latent_coords[:, 1].max():.3f}]")
     print(f"===================================\n")
 
-    # Compute mean frequency, mask counts, and durations in a batched pass
+    # Compute mean frequency, bandwidth, mask counts, and durations in one pass
     print("Computing mean frequencies and extracting metadata...")
     mean_freqs_list = []
+    bandwidths_list = []
     mask_counts_list = []
     durations_list = []
 
@@ -1177,17 +1185,48 @@ def analyze_mouse_latents(
 
         freq_profile = spec.sum(dim=2)                 # (B, H) — sum over time
         total = freq_profile.sum(dim=1).clamp(min=1e-10)
-        mean_freqs_list.append(
-            ((freq_profile * freq_bins).sum(dim=1) / total).numpy()
-        )
+        mean_freq = (freq_profile * freq_bins).sum(dim=1) / total   # (B,)
+        mean_freqs_list.append(mean_freq.numpy())
+
+        # Spectral bandwidth = energy-weighted standard deviation of the frequency
+        # profile about that centroid: how spread out in frequency the syllable is,
+        # in the SAME units as mean frequency. A pure whistle comes out near zero, a
+        # harmonic stack or a broadband call comes out wide. Computed here rather
+        # than from the SAM mask so it does not inherit the mask's segmentation.
+        deviation = freq_bins.unsqueeze(0) - mean_freq.unsqueeze(1)   # (B, H)
+        variance = (freq_profile * deviation ** 2).sum(dim=1) / total
+        bandwidths_list.append(torch.sqrt(variance.clamp(min=0)).numpy())
 
         mask_counts_list.append(batch[1].numpy())  # masks_len = SAM mask count (time bins)
 
         durations_list.append(batch[2].numpy())
 
     mean_freqs = np.concatenate(mean_freqs_list)
+    bandwidths  = np.concatenate(bandwidths_list)
     mask_counts = np.concatenate(mask_counts_list)
     durations   = np.concatenate(durations_list)
+
+    # Both quantities come out of the loop in frequency-BIN units. Convert them to
+    # kHz here, or the panels carry a kHz colorbar over bin indices -- which is what
+    # they did until this was fixed, and it is invisible: bin 0..127 over a 30-120
+    # kHz band lands in the same numeric range the label implies.
+    #
+    # The axis is usv-playpen's own: generate_spectrograms band-limits the STFT to
+    # [min_freq, max_freq] and resamples onto num_freq_bins rows, then writes the
+    # axis as linspace(min_freq, max_freq, num_freq_bins) -- see
+    # usv_playpen/processing/generate_spectrograms.py. Defaults there are 30 kHz,
+    # 120 kHz and 128 bins, so one row spans ~709 Hz. Mean frequency is a POSITION
+    # on that axis and takes the offset; bandwidth is a WIDTH and takes only the
+    # scale.
+    if freq_range_khz is not None:
+        f_lo, f_hi = float(freq_range_khz[0]), float(freq_range_khz[1])
+        khz_per_bin = (f_hi - f_lo) / max(1, H - 1)
+        mean_freqs = f_lo + mean_freqs * khz_per_bin
+        bandwidths = bandwidths * khz_per_bin
+        print(f"  frequency axis: {H} bins over {f_lo:g}-{f_hi:g} kHz "
+              f"({khz_per_bin * 1000:.0f} Hz/bin)")
+    print(f"  mean frequency: {mean_freqs.min():.1f}-{mean_freqs.max():.1f}, "
+          f"bandwidth: {bandwidths.min():.1f}-{bandwidths.max():.1f}")
 
     # ============= Aggregated posterior density =============
     # Built once here, before any figure draws it, so the Figure-E grid, Figure FG
@@ -1511,20 +1550,54 @@ def analyze_mouse_latents(
     # ---- assemble the grid ---------------------------------------------------- #
     # A panel whose variable is absent from this dataset is dropped rather than
     # drawn empty, so the grid shrinks instead of filling with blank boxes.
+    #
+    # The high-mask-count panel: only counts in HIGH_MASK_COUNTS carry a colour,
+    # every other syllable is drawn once in the shared missing grey behind them. The
+    # continuous mask-count panel saturates at MASK_COUNT_RANGE[1] and cannot show
+    # which of the high counts a point actually is; this one can, at the cost of
+    # showing nothing else.
+    high_mask_values = np.array(
+        [str(int(m)) if int(m) in HIGH_MASK_COUNTS else None for m in mask_counts],
+        dtype=object,
+    )
+    high_mask_order = [str(m) for m in HIGH_MASK_COUNTS
+                       if (high_mask_values == str(m)).any()]
+    n_high_mask = int(np.sum(high_mask_values != None))  # noqa: E711
+
     panels = [
         ('Mean frequency', lambda ax: draw_latent_scatter(
             ax, latent_coords, mean_freqs, f'Mean frequency ({freq_unit})',
             cmap=CMAP_FREQ, title='Mean frequency',
             scatter_size=scatter_size, scatter_alpha=scatter_alpha)),
-        ('SAM mask count', lambda ax: draw_latent_scatter(
-            ax, latent_coords, mask_counts, 'SAM mask count (time bins)',
-            cmap=CMAP_MASK_COUNT, title='SAM mask count',
+        ('Bandwidth', lambda ax: draw_latent_scatter(
+            ax, latent_coords, bandwidths, f'Spectral bandwidth ({freq_unit})',
+            cmap=CMAP_BANDWIDTH, title='Bandwidth',
             scatter_size=scatter_size, scatter_alpha=scatter_alpha)),
         ('Duration', lambda ax: draw_latent_scatter(
             ax, latent_coords, durations, 'Duration (samples)',
             cmap=CMAP_DURATION, title='Duration',
             scatter_size=scatter_size, scatter_alpha=scatter_alpha)),
+        # Clipped at MASK_COUNT_RANGE, not autoscaled: the long thin tail past 20
+        # otherwise takes the whole colorbar and flattens the 1-3 bulk. Points above
+        # the cap keep their place on the map, drawn at the top colour.
+        ('SAM mask count', lambda ax: draw_latent_scatter(
+            ax, latent_coords, mask_counts,
+            f'SAM mask count (time bins, \u2265{MASK_COUNT_RANGE[1]} clipped)',
+            cmap=CMAP_MASK_COUNT,
+            vmin=MASK_COUNT_RANGE[0], vmax=MASK_COUNT_RANGE[1],
+            title='SAM mask count',
+            scatter_size=scatter_size, scatter_alpha=scatter_alpha)),
+        # Drawn larger and more opaque than the other panels on purpose: counts 4-7
+        # are a small minority of syllables, and at the marker weight that suits a
+        # full-embedding scatter they vanish into the grey backdrop entirely.
+        ('High mask count', lambda ax: draw_latent_scatter(
+            ax, latent_coords, high_mask_values, None,
+            color_map=HIGH_MASK_COLORS, category_order=high_mask_order,
+            title='High mask count', missing_label='other',
+            scatter_size=scatter_size * 2.5,
+            scatter_alpha=min(0.85, scatter_alpha * 3.0))),
     ]
+    print(f"    high mask count (in {HIGH_MASK_COUNTS}): {n_high_mask:,} samples")
 
     if type_values is not None:
         order = [t for t in SESSION_TYPE_ORDER if (type_values == t).any()]
@@ -1560,18 +1633,11 @@ def analyze_mouse_latents(
             title='Social distance',
             scatter_size=scatter_size, scatter_alpha=scatter_alpha)))
 
-    if dec_coords:
-        panels.append(('Segments, closing', lambda ax: draw_segments_overlay(
-            ax, latent_coords, durations, dec_coords, dec_dist,
-            title='Segments \u2014 decreasing social distance',
-            direction='decreasing',
-            scatter_size=scatter_size, scatter_alpha=scatter_alpha)))
-    if inc_coords:
-        panels.append(('Segments, opening', lambda ax: draw_segments_overlay(
-            ax, latent_coords, durations, inc_coords, inc_dist,
-            title='Segments \u2014 increasing social distance',
-            direction='increasing',
-            scatter_size=scatter_size, scatter_alpha=scatter_alpha)))
+    # The decreasing/increasing social-distance segment overlays are deliberately
+    # NOT panels here. They are trajectory plots over ten hand-picked segments, not
+    # a colouring of the whole embedding like every other panel, so they never read
+    # against their neighbours. The segments themselves are still computed above and
+    # still drive the Figure E7 videos below.
 
     # Reference panel: the density every other panel's points were drawn from, and
     # the same image Figures FG and H segment.
@@ -1919,6 +1985,7 @@ def analyze_mouse_latents(
     return {
         'latent_coords': latent_coords,
         'mean_freqs': mean_freqs,
+        'bandwidths': bandwidths,
         'mask_counts': mask_counts,
         'centers': centers,
         'labels': labels,
