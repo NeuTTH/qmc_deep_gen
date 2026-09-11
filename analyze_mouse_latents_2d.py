@@ -26,7 +26,9 @@ from models.sampling import gen_fib_basis
 from train.model_saving_loading import load
 from train.losses import binary_lp
 from torch.optim import Adam
-from data.mouse_data import load_full_mouse_data, load_mouse_data, mouse_data
+from data.mouse_data import (
+    ConditionGroupedBatchSampler, load_full_mouse_data, load_mouse_data, mouse_data,
+)
 from data import conditionals
 from analysis.model_helpers import get_posterior_summaries, torus_forward, torus_reverse
 from analysis.clustering import run_mean_shift, run_mean_shift_fast
@@ -106,27 +108,320 @@ def _refine_session_types(session_types, session_ids, csv_path):
     return list(refined)
 
 
-def _make_c_fn(cond_name, device):
+# ---------------------------------------------------------------------------
+# Conditioning-homogeneous batching at INFERENCE.
+#
+# The QMCLVM decodes ONE lattice per batch against ONE ``c``:
+# ``QMCLVM.posterior_probability`` builds ``basis = [lattice_basis,
+# c.repeat(n_lattice, 1)]`` and scores EVERY row of the batch against that single
+# stack of decoded images. That is exact only when every row in the batch shares
+# the ``c`` it is scored against -- the same structural constraint training has,
+# and the reason training draws its batches through ``ConditionGroupedBatchSampler``
+# (see data/mouse_data.py and data/conditionals.py).
+#
+# Inference did not do this. It ran the ordinary dataset-order loader and averaged
+# the batch's conditioning values, so at the launcher's batch_size=512 each
+# spectrogram's posterior was computed against a decoder conditioned on roughly the
+# DATASET MARGINAL: a row whose normalized duration is 0.9 was scored by a decoder
+# told about 0.27. The posterior is then wrong and the latent coordinate lands
+# wherever the mismatched decoder happens to explain that row best -- which is to
+# say every conditional embedding was wrong, with no visible symptom.
+#
+# batch_size=1 would be exact and is not affordable: ``posterior_probability``
+# decodes the WHOLE LATTICE once per batch, so one row per batch means one full
+# lattice decode per spectrogram -- 365,150 decodes of 46,368 points for the full
+# corpus. Grouping the batches makes the existing one-``c``-per-batch decode
+# correct instead, at one decode per batch exactly as before.
+#
+# The cost of grouping is that the loader no longer walks the dataset in order, and
+# ``get_posterior_summaries`` assembles its outputs with vstack/concatenate over
+# batches -- i.e. in LOADER order. Every consumer downstream joins those arrays
+# positionally against dataset-order metadata (spec_id, durations, mask counts,
+# session types, the recon breakdown, and the external probe in
+# scripts/dataset_construct/14_fig11_latent_probe.py, which indexes
+# posterior_cache.npz straight against full_data.npz). So the permutation is
+# captured here and inverted on the way out; a silent misalignment there would be
+# worse than the bug being fixed.
+# ---------------------------------------------------------------------------
+
+# Largest within-batch spread of the conditioning value still treated as
+# homogeneous. These mirror ``bartul_mouse_cond._DISCRETE_SPREAD_TOL`` /
+# ``_CONTINUOUS_SPREAD_TOL``; they are restated rather than imported because
+# importing the training driver into an analysis script would drag train/,
+# plotting.visualize and bartul_mouse in for two floats. Identical one-hots differ
+# by exactly nothing, so for a discrete conditional anything above float noise
+# means the grouping broke. A continuous conditional legitimately spans its
+# quantile bin, so callers measure the widest bin they actually built and pass it
+# in; the 0.5 fallback is set to catch the regression (an ungrouped batch spans
+# nearly the whole [0, 1] range), not to police the bin width.
+_DISCRETE_SPREAD_TOL = 1e-6
+_CONTINUOUS_SPREAD_TOL = 0.5
+
+
+def _c_batch_mean(vals, cond_name, spread_tol=None, strict=None, warned=None):
+    """Collapse per-row conditioning values to the single ``(1, c_dim)`` vector the
+    decoder takes, having first checked the collapse means anything.
+
+    The inference twin of the guard in ``bartul_mouse_cond.make_collate_fn``, and
+    deliberately the same behaviour: a discrete conditional RAISES (identical
+    one-hots differ by exactly nothing, so any spread can only be a bug), a
+    continuous one WARNS once against the widest quantile bin the grouping actually
+    produced (a fat tail bin is legitimately wide).
+
+    The batch mean is still how ``c`` is formed -- it is exact on a homogeneous
+    batch -- but on a MIXED batch the mean of 512 shuffled values is just the
+    dataset marginal: the same near-constant vector for every batch, telling the
+    decoder nothing about the rows it is scoring. That is the bug the grouping
+    exists to remove, and it is invisible in the output, so it is checked rather
+    than assumed.
+
+    Args:
+        vals: ``(B, c_dim)`` per-row conditioning values for one batch.
+        cond_name: key into ``data.conditionals``; its ``kind`` picks the defaults.
+        spread_tol: largest tolerated max-minus-min, worst component. Default
+            ``_DISCRETE_SPREAD_TOL`` for a discrete conditional, else
+            ``_CONTINUOUS_SPREAD_TOL``; pass the measured widest bin for the exact
+            bound.
+        strict: raise instead of warn. Defaults to True for a discrete conditional.
+        warned: optional ``{"already": bool}`` used to warn once per pass rather
+            than once per batch. Unlike the training collate this runs in the MAIN
+            process (``get_posterior_summaries`` calls it on the collated batch), so
+            warn-once really is once.
+    """
+    entry = conditionals.resolve(cond_name)
+    if strict is None:
+        strict = entry["kind"] == "discrete"
+    if spread_tol is None:
+        spread_tol = (_DISCRETE_SPREAD_TOL if entry["kind"] == "discrete"
+                      else _CONTINUOUS_SPREAD_TOL)
+
+    if vals.shape[0] > 1:
+        spread = float((vals.max(dim=0).values - vals.min(dim=0).values).max())
+        if spread > spread_tol:
+            message = (
+                f"conditioning is NOT homogeneous within this inference batch: "
+                f"spread={spread:.4g} > tol={spread_tol:.4g} over {vals.shape[0]} "
+                f"rows for {cond_name!r}. The batch mean of a mixed batch is the "
+                f"dataset marginal, so every posterior in it is computed against a "
+                f"decoder that was told nothing about these rows -- pass "
+                f"batch_sampler=ConditionGroupedBatchSampler(...) to the DataLoader "
+                f"instead of a plain dataset-order loader."
+            )
+            if strict:
+                raise ValueError(message)
+            if warned is None or not warned.get("already"):
+                print(f"WARNING: {message}")
+                if warned is not None:
+                    warned["already"] = True
+
+    return vals.mean(dim=0, keepdim=True)
+
+
+def _make_c_fn(cond_name, device, spread_tol=None, strict=None):
     """Return a callable ``c_fn(batch) -> Tensor (1, c_dim)`` for use with
     ``get_posterior_summaries``.  ``batch`` comes from the default DataLoader
-    collate so each element is already a batched tensor."""
+    collate so each element is already a batched tensor.
+
+    The batch mean is kept -- it is the exact conditioning value on a
+    conditioning-homogeneous batch, which is what
+    :func:`_grouped_inference_batches` now guarantees the loader yields -- but it is
+    guarded rather than trusted. See :func:`_c_batch_mean`.
+    """
     fi = conditionals.resolve(cond_name)["field_idx"]
+    warned = {"already": False}
 
     def c_fn(batch):
         vals = batch[fi].float()          # (B,) or (B, c_dim)
         if vals.dim() == 1:
             vals = vals.unsqueeze(1)      # (B, 1)
-        return vals.mean(dim=0, keepdim=True).to(device)  # (1, c_dim)
+        c = _c_batch_mean(vals, cond_name, spread_tol=spread_tol,
+                          strict=strict, warned=warned)
+        return c.to(device)               # (1, c_dim)
 
     return c_fn
+
+
+def _grouped_inference_batches(dataset, cond_name, batch_size,
+                               n_bins=conditionals.DEFAULT_COND_N_BINS, seed=42):
+    """Conditioning-homogeneous batches over ``dataset``, plus the permutation they
+    imply and the tolerance its batches deserve.
+
+    Reuses ``ConditionGroupedBatchSampler`` -- the very class training batches
+    through -- rather than a second implementation of the same grouping, so
+    inference and training cannot drift in what "homogeneous" means.
+
+    ``shuffle=False``: inference is one deterministic pass, and there is nothing to
+    gain from varying batch membership. ``drop_last=False`` is not optional -- a
+    dropped row is a row with no posterior, and every array downstream is joined
+    positionally against dataset-order metadata.
+
+    The batch LIST is materialized once here and is meant to be handed to the
+    DataLoader as its ``batch_sampler`` (which forbids ``batch_size`` / ``shuffle``
+    / ``drop_last`` alongside it). Handing over the same list that produced ``perm``
+    is what makes the permutation a fact rather than a re-derivation that could
+    disagree with what the loader actually walked.
+
+    Returns:
+        batches: ``list[list[int]]`` -- dataset indices per batch, in loader order.
+        perm: ``(N,)`` int array; ``perm[k]`` is the dataset index of the k-th row a
+            loader walking ``batches`` yields.
+        inverse: ``(N,)`` int array; the inverse permutation, so
+            ``loader_order_array[inverse]`` is back in dataset order and
+            ``perm[inverse] == arange(N)``.
+        spread_tol: float or None -- the within-batch spread the homogeneity guard
+            should tolerate. None for a discrete conditional (the guard's own
+            zero-tolerance default is right); for a continuous one, the width of the
+            widest bin the grouping actually produced, measured rather than guessed
+            so a fat tail bin does not raise a false alarm while a genuinely mixed
+            batch still does.
+        summary: one-line description for the log.
+    """
+    entry = conditionals.resolve(cond_name)
+    gids = conditionals.group_ids(dataset, cond_name, n_bins)
+    sampler = ConditionGroupedBatchSampler(
+        gids, batch_size=batch_size, shuffle=False, drop_last=False, seed=seed,
+    )
+    batches = [[int(i) for i in b] for b in sampler]
+
+    n = len(dataset)
+    perm = (np.concatenate([np.asarray(b, dtype=np.int64) for b in batches])
+            if batches else np.zeros(0, dtype=np.int64))
+    if len(perm) != n or not np.array_equal(np.sort(perm), np.arange(n)):
+        raise RuntimeError(
+            f"grouped inference batches do not cover the dataset exactly: "
+            f"{len(perm)} indices for {n} rows. Every row must appear exactly once "
+            f"or the posterior arrays cannot be put back into dataset order."
+        )
+    inverse = np.argsort(perm, kind="stable")
+    # The round-trip assertion lives in the CODE, not only in the tests. A permuted
+    # posterior joined against dataset-order metadata produces plausible figures of
+    # the wrong thing, and this repo has been bitten by exactly this class of
+    # positional mismatch before (see CLAUDE.md, "prior bugs came from tuple-index
+    # shifts breaking consumers").
+    if not np.array_equal(perm[inverse], np.arange(n)):
+        raise RuntimeError("grouped-batch permutation does not round-trip; refusing "
+                           "to embed with an order that cannot be undone.")
+
+    spread_tol, widest = None, None
+    if entry["kind"] != "discrete":
+        raw = conditionals._raw_values(dataset, cond_name).reshape(-1)
+        widest = float(max(np.ptp(raw[gids == g]) for g in np.unique(gids)))
+        spread_tol = widest * 1.05 + 1e-6
+
+    sizes = sampler.group_sizes()
+    summary = (
+        f"grouped batching for {cond_name!r}: {len(sizes)} groups over {n} rows "
+        f"(group size min={int(sizes.min())} median={int(np.median(sizes))} "
+        f"max={int(sizes.max())}), {len(batches)} batches of at most {batch_size}"
+    )
+    if widest is not None:
+        summary += (f"; widest bin spans {widest:.4g} in the conditioning value, "
+                    f"which is the batch-mean error this leaves behind")
+    return batches, perm, inverse, spread_tol, summary
+
+
+# Bumped whenever the MEANING of the cached arrays changes, not merely their
+# contents. v2 is the first version to record anything at all: a v1 file carries no
+# stamp, was written by the code that conditioned every posterior on the BATCH MEAN
+# of a 512-row dataset-order batch, and for a conditional run its numbers are wrong
+# rather than stale -- no re-ordering can repair them. See _read_posterior_cache.
+_POSTERIOR_CACHE_VERSION = 2
+
+
+def _read_posterior_cache(cache_path, conditional, n_samples):
+    """Load ``posterior_cache.npz`` if it is valid for THIS run, else None.
+
+    The cache is keyed by directory alone -- nothing in the path says which model,
+    dataset or conditioning produced it -- so the little that CAN be checked is
+    checked here, loudly, and a file that fails is recomputed rather than trusted.
+
+    ROW ORDER IS DATASET ORDER, always, in both the conditional and unconditional
+    paths. That is what the arrays mean everywhere else: every consumer indexes them
+    against dataset-order metadata, including one outside this repo
+    (scripts/dataset_construct/14_fig11_latent_probe.py reads torus_weighted
+    straight against the corpus's full_data.npz). The conditional path computes the
+    posteriors in grouped-batch order and un-permutes BEFORE caching, so a cache
+    never holds loader order.
+
+    A v1 (unstamped) file is REFUSED FOR A CONDITIONAL RUN and accepted for an
+    unconditional one. v1 is everything written before the conditional posterior
+    pass was grouped, when every row's posterior was computed against the batch
+    mean of a 512-row dataset-order batch, i.e. against the dataset marginal: for a
+    conditional run those numbers are wrong rather than stale and no re-ordering
+    can repair them. An unconditional posterior never involved a conditioning value
+    at all, so a v1 file written by one is exactly what this code would write
+    today, and the existing full-corpus caches (phases 2-3, hours of GPU each) stay
+    usable. The two cases are not confusable in practice: a save_dir lives inside
+    its own run directory, and an unconditional analysis pointed at a conditional
+    run's directory cannot even load the checkpoint -- c_dim widens the decoder's
+    first layer.
+    """
+    if not os.path.exists(cache_path):
+        return None
+
+    cache = np.load(cache_path, allow_pickle=False)
+
+    def reject(reason):
+        print(f"  IGNORING the posterior cache at {cache_path}: {reason}. "
+              f"Recomputing (and overwriting it) instead.")
+        return None
+
+    version = int(cache["format_version"]) if "format_version" in cache.files else 1
+    if version != _POSTERIOR_CACHE_VERSION:
+        if conditional is not None:
+            return reject(
+                f"format_version={version}, this build writes "
+                f"v{_POSTERIOR_CACHE_VERSION}. A v{version} file was written before "
+                f"conditional posteriors were grouped, so every row in it was "
+                f"conditioned on the batch mean -- on the dataset marginal, not on "
+                f"its own value"
+            )
+        stamp = f"format v{version} (pre-stamp, unconditional: nothing to invalidate)"
+    else:
+        want = "" if conditional is None else str(conditional)
+        got = str(cache["conditional"])
+        if got != want:
+            return reject(f"written for conditional={got or None!r} but this run is "
+                          f"conditional={conditional!r}")
+        stamp = (f"format v{version}, conditional={got or None}, "
+                 f"row order={str(cache['row_order'])}")
+
+    torus_weighted = cache["torus_weighted"]
+    if len(torus_weighted) != n_samples:
+        return reject(f"holds {len(torus_weighted)} rows but this dataset has "
+                      f"{n_samples}")
+
+    print(f"Loading cached posteriors from {cache_path} ({stamp})")
+    return torus_weighted, cache["aggregated"], cache["weights"]
+
+
+def _write_posterior_cache(cache_path, conditional, torus_weighted, aggregated, weights):
+    """Write the posterior summaries plus the stamp that says what they mean."""
+    np.savez(
+        cache_path,
+        torus_weighted=torus_weighted, aggregated=aggregated, weights=weights,
+        format_version=np.array(_POSTERIOR_CACHE_VERSION),
+        conditional=np.array("" if conditional is None else str(conditional)),
+        # Recorded rather than implied: the conditional path computes these in
+        # grouped-batch order, and a reader has no other way to know they were put
+        # back before being written.
+        row_order=np.array("dataset"),
+        n_samples=np.array(len(torus_weighted)),
+    )
+    print(f"Cached posteriors to {cache_path} "
+          f"(format v{_POSTERIOR_CACHE_VERSION}, row order=dataset)")
 
 
 def _get_sample_c(dataset, index, cond_name, device):
     """Extract the conditioning tensor for a single dataset sample → (1, c_dim).
 
-    Kept as a name because the call sites below read better for it; the body is
-    ``conditionals.sample_c``, so the conditional-to-tuple-slot mapping lives in
-    exactly one place.
+    A thin alias for ``conditionals.sample_c``, so the conditional-to-tuple-slot
+    mapping lives in exactly one place. Its one call site -- the reconstruction
+    loop -- no longer uses it: that loop now reads the conditioning value off the
+    dataset items it has already loaded, rather than re-indexing the dataset and
+    decoding the whole spectrogram a second time to reach one scalar. Kept because
+    it is the readable way to ask for one row's ``c`` and the grid-sweep figures
+    below are its natural next caller.
     """
     return conditionals.sample_c(dataset, index, cond_name, device=device)
 
@@ -975,6 +1270,8 @@ def analyze_mouse_latents(
     min_seg_len=20,
     grid_size=15,
     n_per_cluster=16,
+    cluster_sample_figures=True,
+    watershed_max_clusters=10,
     sample_from_centroid=False,
     cache_posteriors=False,
     # reconstruction diagnostics
@@ -990,6 +1287,7 @@ def analyze_mouse_latents(
     # conditional model support
     conditional=None,         # a data.conditionals key, or None for unconditional
     mask_count_classes=None,  # slot-5 one-hot width; None = derive / dataset default
+    cond_n_bins=conditionals.DEFAULT_COND_N_BINS,  # quantile bins for grouped batching
     # data filtering
     filter_mask=True,
     lo=1,
@@ -1006,7 +1304,13 @@ def analyze_mouse_latents(
         save_dir: Directory to save output figures
         lattice_m: Fibonacci lattice parameter (m=20 gives ~10K points)
         bandwidth: Bandwidth for mean-shift clustering
-        batch_size: Batch size for data loading
+        batch_size: Batch size for the posterior and metadata dataloaders.
+            With a conditional model the posterior batches are drawn grouped by
+            conditioning value, so a large batch is now CORRECT as well as fast:
+            every row in a batch shares the ``c`` its posterior is computed
+            against. It used to be neither -- the batch mean of a dataset-order
+            batch is the dataset marginal -- which is why the default is still the
+            safe-but-slow 1 rather than a value tuned for the old behaviour.
         freq_range_khz: (min, max) frequency range in kHz of the spectrogram's
             frequency axis, used to convert mean frequency and bandwidth out of bin
             units. Default (30, 120) matches usv-playpen's generate_spectrograms
@@ -1015,7 +1319,15 @@ def analyze_mouse_latents(
         scatter_size: Point size for scatter plot (default 3)
         scatter_alpha: Transparency for scatter plot (default 0.3)
         beh_features_path: Path to pkl with {session_id -> DataFrame(avg_social_distance, emitter_sex)}
-        cache_posteriors: If True, save/load posterior summaries to/from save_dir/posterior_cache.npz
+        cache_posteriors: If True, save/load posterior summaries to/from
+            save_dir/posterior_cache.npz. The file is keyed by directory alone, so
+            it carries a format version and the name of the conditional it was
+            written for, and a file that does not match this run is ignored and
+            recomputed rather than trusted. A cache predating that stamp is refused
+            for a CONDITIONAL run -- it was written when every conditional posterior
+            was computed against the batch mean, so its contents are wrong rather
+            than merely stale -- and accepted for an unconditional one, which never
+            had a conditioning value to get wrong. Rows are always in DATASET order.
         compute_recon: If True, compute round-trip MSE and save bar charts
         recon_batch_size: Batch size for reconstruction MSE computation
         n_dur_bins: Number of duration quantile bins for the bar chart
@@ -1040,6 +1352,15 @@ def analyze_mouse_latents(
             width IS the decoder's c_dim, and otherwise the dataset keeps its own
             default. Set it only to reproduce a run whose dataset was built with a
             non-default width.
+        cond_n_bins: Quantile bins a CONTINUOUS conditional ("duration",
+            "mean_freq") is grouped into for the posterior and reconstruction
+            passes. Ignored for a discrete conditional, which groups by class, and
+            for an unconditional run. The default matches the training driver's, so
+            inference groups the rows exactly as training did. Raising it tightens
+            the only approximation left -- the batch mean within a bin -- at a cost
+            of roughly one extra lattice decode per extra bin, which is nothing
+            against one decode per batch; the log line reports the widest bin the
+            grouping actually produced so the size of that approximation is visible.
         apply_mask: Override whether spectrograms are multiplied by their mask.
             Leave None to let the dataset decide -- an unmasked set built with
             --no-apply-mask must be embedded unmasked, or the reconstruction
@@ -1159,22 +1480,60 @@ def analyze_mouse_latents(
     # raw coordinate happens to land inside the unit square.
     lattice_np = lattice.numpy() % 1.0
     cache_path = os.path.join(save_dir, 'posterior_cache.npz')
-    if cache_posteriors and os.path.exists(cache_path):
-        print(f"Loading cached posteriors from {cache_path}...")
-        cache = np.load(cache_path)
-        torus_weighted, aggregated, weights = cache['torus_weighted'], cache['aggregated'], cache['weights']
+    cached = (_read_posterior_cache(cache_path, conditional, len(full_ds))
+              if cache_posteriors else None)
+    if cached is not None:
+        torus_weighted, aggregated, weights = cached
     else:
         print("Computing posteriors...")
-        c_fn = _make_c_fn(conditional, device) if conditional is not None else None
-        if conditional is not None and batch_size > 1:
-            print(f"  Warning: batch_size={batch_size} with conditional model — posterior uses "
-                  f"batch-mean c, not per-sample c. Set batch_size=1 for exact per-sample conditioning.")
+        if conditional is None:
+            # The unconditional path, unchanged: the dataset-order loader built
+            # above, no grouping and no permutation. There is no ``c`` here for a
+            # batch to be homogeneous about.
+            posterior_loader, posterior_inverse, c_fn = test_loader, None, None
+        else:
+            # One lattice decode per batch, exactly as before -- but every row in
+            # the batch now shares the ``c`` it is decoded against, so the batch
+            # mean IS that row's value (discrete) or a point inside the one
+            # quantile bin the rows came from (continuous).
+            batches, _perm, posterior_inverse, spread_tol, summary = \
+                _grouped_inference_batches(full_ds, conditional, batch_size,
+                                           n_bins=cond_n_bins)
+            print(f"  {summary}")
+            c_fn = _make_c_fn(conditional, device, spread_tol=spread_tol)
+            # batch_sampler owns batching entirely: DataLoader forbids passing
+            # batch_size / shuffle / drop_last alongside it. The list handed over is
+            # the same object `posterior_inverse` was derived from, so the order
+            # walked and the order inverted cannot disagree.
+            posterior_loader = DataLoader(full_ds, num_workers=n_workers,
+                                          batch_sampler=batches)
+
         torus_weighted, aggregated, weights = get_posterior_summaries(
-            model, lattice, test_loader, binary_lp, c_fn=c_fn
+            model, lattice, posterior_loader, binary_lp, c_fn=c_fn
         )
+
+        if posterior_inverse is not None:
+            # get_posterior_summaries vstacks/concatenates its per-batch outputs, so
+            # these two come back in LOADER order. Put them back into dataset order
+            # here, before anything else touches them: latent_coords, every metadata
+            # column, the recon breakdown, each figure and the external probe in
+            # scripts/dataset_construct/ all join them positionally on dataset index.
+            #
+            # `aggregated` is deliberately NOT re-indexed, and this is not an
+            # oversight to be "fixed" later: it is the sum over all samples of the
+            # posterior at each LATTICE point -- shape (n_lattice,), not
+            # (n_samples,) -- so it is order-independent by construction. Permuting
+            # it would scramble the lattice, not unscramble the samples.
+            assert len(torus_weighted) == len(full_ds) == len(posterior_inverse), (
+                f"posterior returned {len(torus_weighted)} rows for "
+                f"{len(full_ds)} dataset rows; refusing to un-permute a length "
+                f"mismatch")
+            torus_weighted = torus_weighted[posterior_inverse]
+            weights = weights[posterior_inverse]
+
         if cache_posteriors:
-            np.savez(cache_path, torus_weighted=torus_weighted, aggregated=aggregated, weights=weights)
-            print(f"Cached posteriors to {cache_path}")
+            _write_posterior_cache(cache_path, conditional,
+                                   torus_weighted, aggregated, weights)
 
     # Posterior mean embedding (torus-aware, continuous)
     latent_coords = torus_reverse(torus_weighted, dim=2)      # (n_samples, 2)
@@ -1318,38 +1677,69 @@ def analyze_mouse_latents(
         # metric that survives the comparison. The out-of-mask error is kept too --
         # for a masked run it measures how well the model reproduces the zeroing,
         # and for an unmasked run how well it reproduces the background.
-        all_mse = []
-        all_mse_in = []
-        all_mse_out = []
+        n_rows = len(full_ds)
+        # The SAME grouping as the posterior pass, for the same reason: round_trip
+        # goes through posterior_probability, which decodes one lattice against one
+        # ``c``, so a contiguous dataset-order chunk of 64 rows was reconstructed
+        # from a decoder conditioned on the mean of 64 unrelated conditioning values
+        # -- the same batch-mean bug, in the numbers that go into
+        # recon_mse_breakdown.npz. Unconditionally there is nothing to group, so the
+        # batches stay the contiguous chunks they have always been.
+        if conditional is None:
+            recon_batches = [list(range(s, min(s + recon_batch_size, n_rows)))
+                             for s in range(0, n_rows, recon_batch_size)]
+            recon_spread_tol = None
+        else:
+            recon_batches, _, _, recon_spread_tol, recon_summary = \
+                _grouped_inference_batches(full_ds, conditional, recon_batch_size,
+                                           n_bins=cond_n_bins)
+            print(f"  recon {recon_summary}")
+        # Filled BY DATASET INDEX rather than appended in loader order, so the
+        # grouping never reaches the arrays: these are joined positionally against
+        # mask_counts, durations, session_types and spec_ids below. NaN-initialized
+        # so a row that never got written is caught rather than read as zero.
+        mse_arr = np.full(n_rows, np.nan, dtype=np.float32)
+        mse_in_arr = np.full(n_rows, np.nan, dtype=np.float32)
+        mse_out_arr = np.full(n_rows, np.nan, dtype=np.float32)
+        recon_warned = {"already": False}
+        fi_recon = (conditionals.resolve(conditional)["field_idx"]
+                    if conditional is not None else None)
         model.eval()
         with torch.no_grad():
-            for start in tqdm(range(0, len(full_ds), recon_batch_size), desc="recon MSE"):
-                end = min(start + recon_batch_size, len(full_ds))
-                items = [full_ds[i] for i in range(start, end)]
+            for rows in tqdm(recon_batches, desc="recon MSE"):
+                items = [full_ds[i] for i in rows]
                 specs = torch.stack([it[0] for it in items]).to(torch.float32).to(device)
                 if conditional is not None:
+                    # Read the conditioning value off the items already loaded
+                    # instead of re-indexing the dataset, which would decode and
+                    # renormalize the whole spectrogram a second time to read one
+                    # scalar. _c_batch_mean is the same guarded collapse the
+                    # posterior pass uses.
                     c_vals = torch.stack([
-                        _get_sample_c(full_ds, idx, conditional, device).squeeze(0)
-                        for idx in range(start, end)
-                    ])                                          # (B, c_dim)
-                    c_batch = c_vals.mean(dim=0, keepdim=True) # (1, c_dim)
+                        it[fi_recon].float() if it[fi_recon].dim() > 0
+                        else it[fi_recon].float().unsqueeze(0)
+                        for it in items
+                    ]).to(device)                               # (B, c_dim)
+                    c_batch = _c_batch_mean(c_vals, conditional,
+                                            spread_tol=recon_spread_tol,
+                                            warned=recon_warned)   # (1, c_dim)
                     recon = model.round_trip(lattice.to(device), specs, _lp_fnc, c=c_batch)
                 else:
                     recon = model.round_trip(lattice.to(device), specs, _lp_fnc)
                 squared = (recon.cpu() - specs.cpu()) ** 2          # (B, 1, H, W)
-                all_mse.extend(squared.mean(dim=(1, 2, 3)).numpy().tolist())
+                idx = np.asarray(rows, dtype=np.int64)
+                mse_arr[idx] = squared.mean(dim=(1, 2, 3)).numpy()
 
                 inside = (torch.stack([it[6] for it in items]).unsqueeze(1) > 0.5)
                 n_in = inside.sum(dim=(1, 2, 3)).clamp(min=1)
                 n_out = (~inside).sum(dim=(1, 2, 3)).clamp(min=1)
-                all_mse_in.extend(
-                    ((squared * inside).sum(dim=(1, 2, 3)) / n_in).numpy().tolist())
-                all_mse_out.extend(
-                    ((squared * ~inside).sum(dim=(1, 2, 3)) / n_out).numpy().tolist())
+                mse_in_arr[idx] = ((squared * inside).sum(dim=(1, 2, 3)) / n_in).numpy()
+                mse_out_arr[idx] = ((squared * ~inside).sum(dim=(1, 2, 3)) / n_out).numpy()
         model.eval()  # keep in eval for subsequent figure generation
-        mse_arr = np.array(all_mse, dtype=np.float32)
-        mse_in_arr = np.array(all_mse_in, dtype=np.float32)
-        mse_out_arr = np.array(all_mse_out, dtype=np.float32)
+        # Every row must have been written exactly once. An unfilled slot means the
+        # batching dropped a row, which nothing downstream would notice.
+        assert not np.isnan(mse_arr).any(), (
+            f"{int(np.isnan(mse_arr).sum())} of {n_rows} rows got no reconstruction")
         print(f"  Mean MSE: {mse_arr.mean():.4f}  (std {mse_arr.std():.4f})")
         print(f"  Mean MSE inside the SAM mask:  {mse_in_arr.mean():.4f}")
         print(f"  Mean MSE outside the SAM mask: {mse_out_arr.mean():.4f}")
@@ -1865,6 +2255,29 @@ def analyze_mouse_latents(
         save_path=os.path.join(save_dir, 'figure_H_watershed_grid.png'),
     )
 
+    # The sweep above is seeded from the mean-shift centroids, so every cell in it
+    # returns exactly len(centers) basins -- it varies the BOUNDARIES and nothing
+    # else, and you cannot pick a cluster count out of it. This second sweep seeds
+    # from the local maxima of the smoothed posterior instead, which makes sigma
+    # the knob that sets the count, and reports the setting with the most clusters
+    # still under watershed_max_clusters. Both are kept: the first answers "where
+    # do these centroids put the boundaries", the second answers "how many groups
+    # does this density actually have at a given scale".
+    from analysis.watershed_sweep import figure_watershed_sweep
+    ws_choice, ws_n, ws_labels_sel = figure_watershed_sweep(
+        heatmap_lattice,
+        save_path=os.path.join(save_dir, 'figure_H_watershed_sweep.png'),
+        max_clusters=watershed_max_clusters,
+        cmap=CMAP_POSTERIOR, overlay_color=OVERLAY_COLOR,
+    )
+    if ws_choice is None:
+        print(f"  NOTE: no setting in the sweep falls under "
+              f"{watershed_max_clusters} clusters; nothing selected.")
+    else:
+        print(f"  Selected: sigma={ws_choice[0]}, compactness={ws_choice[1]} "
+              f"-> {ws_n} clusters (most structure under {watershed_max_clusters})")
+    print("Saved: figure_H_watershed_sweep.png")
+
     n_clusters_found = len(centers)
     n_cols_h = int(np.ceil(np.sqrt(n_per_cluster)))
     n_rows_h = int(np.ceil(n_per_cluster / n_cols_h))
@@ -1875,130 +2288,144 @@ def analyze_mouse_latents(
 
     import matplotlib.gridspec as gridspec
 
-    for ci in range(n_clusters_found):
-        mask = np.where(sample_cluster == ci + 1)[0]
+    # One figure per cluster, and there can be dozens (the phase-2 full-corpus
+    # run wrote 30, ~18 MB). They are the slowest and bulkiest part of the
+    # figure set and are off for the conditional runs, which want the Figure-E
+    # grid and the watershed sweep only.
+    if cluster_sample_figures:
+        for ci in range(n_clusters_found):
+            mask = np.where(sample_cluster == ci + 1)[0]
 
-        picks = []
-        if len(mask) > 0:
-            pts = latent_coords[mask]
-            used = set()
-            if sample_from_centroid:
-                # Archimedean spiral outward from cluster centroid; skip points
-                # falling outside this cluster's watershed region.
-                cx0, cy0 = centers[ci]
-                dists_c = np.sqrt((pts[:, 0] - cx0) ** 2 + (pts[:, 1] - cy0) ** 2)
-                r_max = float(dists_c.max()) if len(dists_c) > 0 else 0.1
-                n_turns = 4
-                n_dense = 4000
-                t_dense = np.linspace(0.0, 1.0, n_dense)
-                theta_d = 2 * np.pi * n_turns * t_dense
-                r_d = r_max * t_dense
-                xs_d = cx0 + r_d * np.cos(theta_d)
-                ys_d = cy0 + r_d * np.sin(theta_d)
-                px_d = np.clip((xs_d * res).astype(int), 0, res - 1)
-                py_d = np.clip((ys_d * res).astype(int), 0, res - 1)
-                inside = (
-                    (xs_d >= 0) & (xs_d <= 1) & (ys_d >= 0) & (ys_d <= 1)
-                    & (ws_labels[py_d, px_d] == ci + 1)
-                )
-                xs_in = xs_d[inside]
-                ys_in = ys_d[inside]
-                if len(xs_in) >= n_per_cluster:
-                    sel = np.linspace(0, len(xs_in) - 1, n_per_cluster).astype(int)
-                    xs_in = xs_in[sel]
-                    ys_in = ys_in[sel]
-                targets = list(zip(xs_in, ys_in))
-                for tx_, ty_ in targets:
-                    d2 = (pts[:, 0] - tx_) ** 2 + (pts[:, 1] - ty_) ** 2
-                    for kk in np.argsort(d2):
-                        idx = int(mask[kk])
-                        if idx not in used:
-                            used.add(idx)
-                            picks.append(idx)
-                            break
-            else:
-                # Tile-based sampling: partition cluster bbox into tiles
-                x_min, y_min = pts.min(axis=0)
-                x_max, y_max = pts.max(axis=0)
-                x_max = max(x_max, x_min + 1e-6)
-                y_max = max(y_max, y_min + 1e-6)
-                tx = np.linspace(x_min, x_max, n_cols_h + 1)
-                ty = np.linspace(y_min, y_max, n_rows_h + 1)
-                # Iterate top -> bottom, left -> right
-                for rr in range(n_rows_h - 1, -1, -1):
-                    for cc in range(n_cols_h):
-                        if len(picks) >= n_per_cluster:
-                            break
-                        cx_t = 0.5 * (tx[cc] + tx[cc + 1])
-                        cy_t = 0.5 * (ty[rr] + ty[rr + 1])
-                        d2 = (pts[:, 0] - cx_t) ** 2 + (pts[:, 1] - cy_t) ** 2
-                        for k in np.argsort(d2):
-                            idx = int(mask[k])
+            picks = []
+            if len(mask) > 0:
+                pts = latent_coords[mask]
+                used = set()
+                if sample_from_centroid:
+                    # Archimedean spiral outward from cluster centroid; skip points
+                    # falling outside this cluster's watershed region.
+                    cx0, cy0 = centers[ci]
+                    dists_c = np.sqrt((pts[:, 0] - cx0) ** 2 + (pts[:, 1] - cy0) ** 2)
+                    r_max = float(dists_c.max()) if len(dists_c) > 0 else 0.1
+                    n_turns = 4
+                    n_dense = 4000
+                    t_dense = np.linspace(0.0, 1.0, n_dense)
+                    theta_d = 2 * np.pi * n_turns * t_dense
+                    r_d = r_max * t_dense
+                    xs_d = cx0 + r_d * np.cos(theta_d)
+                    ys_d = cy0 + r_d * np.sin(theta_d)
+                    px_d = np.clip((xs_d * res).astype(int), 0, res - 1)
+                    py_d = np.clip((ys_d * res).astype(int), 0, res - 1)
+                    inside = (
+                        (xs_d >= 0) & (xs_d <= 1) & (ys_d >= 0) & (ys_d <= 1)
+                        & (ws_labels[py_d, px_d] == ci + 1)
+                    )
+                    xs_in = xs_d[inside]
+                    ys_in = ys_d[inside]
+                    if len(xs_in) >= n_per_cluster:
+                        sel = np.linspace(0, len(xs_in) - 1, n_per_cluster).astype(int)
+                        xs_in = xs_in[sel]
+                        ys_in = ys_in[sel]
+                    targets = list(zip(xs_in, ys_in))
+                    for tx_, ty_ in targets:
+                        d2 = (pts[:, 0] - tx_) ** 2 + (pts[:, 1] - ty_) ** 2
+                        for kk in np.argsort(d2):
+                            idx = int(mask[kk])
                             if idx not in used:
                                 used.add(idx)
                                 picks.append(idx)
                                 break
-        picks = np.array(picks, dtype=int)
+                else:
+                    # Tile-based sampling: partition cluster bbox into tiles
+                    x_min, y_min = pts.min(axis=0)
+                    x_max, y_max = pts.max(axis=0)
+                    x_max = max(x_max, x_min + 1e-6)
+                    y_max = max(y_max, y_min + 1e-6)
+                    tx = np.linspace(x_min, x_max, n_cols_h + 1)
+                    ty = np.linspace(y_min, y_max, n_rows_h + 1)
+                    # Iterate top -> bottom, left -> right
+                    for rr in range(n_rows_h - 1, -1, -1):
+                        for cc in range(n_cols_h):
+                            if len(picks) >= n_per_cluster:
+                                break
+                            cx_t = 0.5 * (tx[cc] + tx[cc + 1])
+                            cy_t = 0.5 * (ty[rr] + ty[rr + 1])
+                            d2 = (pts[:, 0] - cx_t) ** 2 + (pts[:, 1] - cy_t) ** 2
+                            for k in np.argsort(d2):
+                                idx = int(mask[k])
+                                if idx not in used:
+                                    used.add(idx)
+                                    picks.append(idx)
+                                    break
+            picks = np.array(picks, dtype=int)
 
-        fig = plt.figure(figsize=(6 + n_cols_h * 1.6, max(6, n_rows_h * 1.6 + 1)))
-        outer = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[1, 1.05], wspace=0.15)
+            fig = plt.figure(figsize=(6 + n_cols_h * 1.6, max(6, n_rows_h * 1.6 + 1)))
+            outer = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[1, 1.05], wspace=0.15)
 
-        # --- Left: the posterior this cluster was carved out of, boundaries on top ---
-        # This panel used to be a mean-frequency scatter, which showed where samples
-        # landed but not the density the watershed actually cut. It now draws the
-        # same aggregated posterior as Figures E and FG, so a basin can be checked
-        # against the mass it claims.
-        ax_l = fig.add_subplot(outer[0, 0])
-        # heatmap_lattice, not heatmap: this panel exists to show the basin the
-        # watershed cut, so it draws the field the watershed was run on. The two
-        # estimators of the posterior agree closely; Figures E and FG use the
-        # sample-space one because they are drawn against per-sample points.
-        draw_posterior_density(ax_l, heatmap_lattice, title=None, colorbar=False)
-        ax_l.contour(xx, yy, ws_labels, levels=boundary_levels,
-                     colors=OVERLAY_COLOR, linewidths=1.0)
-        ax_l.contour(xx, yy, (ws_labels == ci + 1).astype(int), levels=[0.5],
-                     colors=HIGHLIGHT_COLOR, linewidths=2.5)
-        ax_l.scatter(centers[:, 0], centers[:, 1],
-                     c=OVERLAY_COLOR, s=50, marker='x', linewidths=1.2, zorder=9)
-        ax_l.scatter([centers[ci, 0]], [centers[ci, 1]],
-                     c=HIGHLIGHT_COLOR, s=120, marker='x', linewidths=2.5, zorder=10)
-        if len(picks) > 0:
-            for k, pidx in enumerate(picks):
-                ax_l.text(latent_coords[pidx, 0], latent_coords[pidx, 1], str(k + 1),
-                          color=HIGHLIGHT_COLOR, fontsize=7, fontweight='bold',
-                          ha='center', va='center', zorder=12)
-        ax_l.set_title(f'Cluster {ci + 1} (σ=3, compact=0)',
-                       fontsize=12, fontweight='bold', color=HIGHLIGHT_COLOR)
+            # --- Left: the posterior this cluster was carved out of, boundaries on top ---
+            # This panel used to be a mean-frequency scatter, which showed where samples
+            # landed but not the density the watershed actually cut. It now draws the
+            # same aggregated posterior as Figures E and FG, so a basin can be checked
+            # against the mass it claims.
+            ax_l = fig.add_subplot(outer[0, 0])
+            # heatmap_lattice, not heatmap: this panel exists to show the basin the
+            # watershed cut, so it draws the field the watershed was run on. The two
+            # estimators of the posterior agree closely; Figures E and FG use the
+            # sample-space one because they are drawn against per-sample points.
+            draw_posterior_density(ax_l, heatmap_lattice, title=None, colorbar=False)
+            ax_l.contour(xx, yy, ws_labels, levels=boundary_levels,
+                         colors=OVERLAY_COLOR, linewidths=1.0)
+            ax_l.contour(xx, yy, (ws_labels == ci + 1).astype(int), levels=[0.5],
+                         colors=HIGHLIGHT_COLOR, linewidths=2.5)
+            ax_l.scatter(centers[:, 0], centers[:, 1],
+                         c=OVERLAY_COLOR, s=50, marker='x', linewidths=1.2, zorder=9)
+            ax_l.scatter([centers[ci, 0]], [centers[ci, 1]],
+                         c=HIGHLIGHT_COLOR, s=120, marker='x', linewidths=2.5, zorder=10)
+            if len(picks) > 0:
+                for k, pidx in enumerate(picks):
+                    ax_l.text(latent_coords[pidx, 0], latent_coords[pidx, 1], str(k + 1),
+                              color=HIGHLIGHT_COLOR, fontsize=7, fontweight='bold',
+                              ha='center', va='center', zorder=12)
+            ax_l.set_title(f'Cluster {ci + 1} (σ=3, compact=0)',
+                           fontsize=12, fontweight='bold', color=HIGHLIGHT_COLOR)
 
-        # --- Right: tile-sampled spectrograms ---
-        right_gs = gridspec.GridSpecFromSubplotSpec(
-            n_rows_h, n_cols_h, subplot_spec=outer[0, 1], hspace=0.25, wspace=0.1)
-        for j in range(n_rows_h * n_cols_h):
-            rr, cc = divmod(j, n_cols_h)
-            ax_s = fig.add_subplot(right_gs[rr, cc])
-            if j < len(picks):
-                spec = full_ds[picks[j]][0].numpy().squeeze()
-                ax_s.imshow(spec, cmap=CMAP_SPEC, origin='lower', aspect='auto')
-                ax_s.set_title(str(j + 1), fontsize=8, color='black', pad=1)
-                for spine in ax_s.spines.values():
-                    spine.set_visible(False)
-            else:
-                ax_s.axis('off')
-            ax_s.set_xticks([]); ax_s.set_yticks([])
+            # --- Right: tile-sampled spectrograms ---
+            right_gs = gridspec.GridSpecFromSubplotSpec(
+                n_rows_h, n_cols_h, subplot_spec=outer[0, 1], hspace=0.25, wspace=0.1)
+            for j in range(n_rows_h * n_cols_h):
+                rr, cc = divmod(j, n_cols_h)
+                ax_s = fig.add_subplot(right_gs[rr, cc])
+                if j < len(picks):
+                    spec = full_ds[picks[j]][0].numpy().squeeze()
+                    ax_s.imshow(spec, cmap=CMAP_SPEC, origin='lower', aspect='auto')
+                    ax_s.set_title(str(j + 1), fontsize=8, color='black', pad=1)
+                    for spine in ax_s.spines.values():
+                        spine.set_visible(False)
+                else:
+                    ax_s.axis('off')
+                ax_s.set_xticks([]); ax_s.set_yticks([])
 
-        plt.suptitle(f'Figure H — Cluster {ci + 1}: watershed region & tile-sampled examples',
-                     fontsize=12, fontweight='bold')
-        out_path = os.path.join(save_dir, f'figure_H_cluster_{ci + 1:02d}_samples.png')
-        plt.savefig(out_path, dpi=300, bbox_inches='tight')
-        plt.close()
-    print(f"Saved: figure_H_cluster_XX_samples.png ({n_clusters_found} figures)")
+            plt.suptitle(f'Figure H — Cluster {ci + 1}: watershed region & tile-sampled examples',
+                         fontsize=12, fontweight='bold')
+            out_path = os.path.join(save_dir, f'figure_H_cluster_{ci + 1:02d}_samples.png')
+            plt.savefig(out_path, dpi=300, bbox_inches='tight')
+            plt.close()
+        print(f"Saved: figure_H_cluster_XX_samples.png ({n_clusters_found} figures)")
 
     # Save cluster information
     cluster_info = {
         'n_clusters': n_clusters_found,
         'centroids': centers.tolist(),
         'cluster_sizes': [int(np.sum(labels == i)) for i in range(n_clusters_found)],
-        'bandwidth': bandwidth
+        'bandwidth': bandwidth,
+        # The local-maxima sweep's pick, which is a different segmentation from the
+        # mean-shift centroids above; recorded so a reader knows which figure the
+        # cluster count in figure_H_watershed_sweep.png came from.
+        'watershed_sweep': (
+            None if ws_choice is None
+            else {'sigma': ws_choice[0], 'compactness': ws_choice[1],
+                  'n_clusters': int(ws_n), 'max_clusters': watershed_max_clusters}
+        ),
+        'cluster_sample_figures': bool(cluster_sample_figures),
     }
 
     import json
