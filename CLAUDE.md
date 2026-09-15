@@ -89,6 +89,46 @@ Generates QMC sequences:
 - `dynamics_data.py` — motion capture data (AMC format)
 - `toy_dsets.py` — synthetic datasets
 
+### The mouse decoder (`models/qmc_decoder.py`)
+
+**One definition, two heads.** The 128x128 ConvTranspose decoder used to be a literal copy in
+seven files (`bartul_mouse`, `bartul_mouse_cond`, `analyze_mouse_latents_2d`/`_3d`,
+`inference_latents`, `inference_latents_agg`, `conditioning_response`), which had to agree
+exactly or `load_state_dict` raised. It now lives here:
+
+- `build_qmc_decoder(latent_dim, c_dim=0, head="relu")` — `head='legacy'` is the
+  activation-free `Linear -> Linear` pair every phase 0-4 checkpoint was trained with (two
+  affine maps compose to one, so those 8.4M parameters gave a rank-4 map); `head='relu'`
+  inserts the missing activation and is the default for new runs.
+- `head_from_state_dict(state_dict)` — `'legacy'` iff `decoder.1.weight` exists, which it can
+  only do for the activation-free head.
+- `build_for_checkpoint(checkpoint, latent_dim, c_dim=0, map_location="cpu")` -> `(decoder, head)`.
+  **Every load site should use this**, so an old and a new checkpoint both load. Raises on
+  `None` rather than guessing.
+
+The two heads have different `nn.Sequential` indices and therefore different state-dict keys,
+which is what makes the checkpoint self-describing. `bartul_mouse_cond.py` also writes
+`decoder_head` into `run_config.json`; records without that key mean `legacy`.
+
+### Reconstruction readout
+
+`round_trip(..., recon_type=...)` takes `'posterior'` (decode at the circular mean over the
+lattice, the default and what every phase 0-4 figure used), `'argmax'` (decode at the MAP
+lattice point) or `'posterior_recon'` (posterior-weighted mean of the decoded images).
+`'argmax'` used to call `torch.argmax` with no `dim` and raise at batch > 1; fixed.
+
+Rank architectures on `'argmax'`. The mean-of-posterior readout penalises a decoder in
+proportion to how much it sharpens: measured over two seeds, `'posterior'` minus `'argmax'`
+in-mask MSE is +0.0001 for the legacy head, +0.0006 with the ReLU head and +0.0035 with a
+harmonic head.
+
+`compute_val_diagnostics` in both drivers returns a **dict** (`mse`, `mse_argmax`,
+`mse_in_mask`, `mse_out_mask`), not an array. `mse` keeps its old meaning so the committed
+`qmc_val_diagnostics.npz` files stay comparable. `val_frame_baselines(val_dataset, indices)`
+returns the `(global_mean_image, mask_oracle)` pair an in-mask MSE has to be read against;
+both drivers stamp it into the diagnostics. See §14 of
+`docs/qlvm_playpen_runs/training/DECODER_AND_READOUT.md` in the parent repo.
+
 ### Model Saving/Loading (`train/model_saving_loading.py`)
 
 - `save(model, optimizer, run_info, fn)` / `load(model, optimizer, fn)` — standard checkpoint pattern
@@ -103,22 +143,52 @@ Post-training analysis tools:
 
 ### Post-training analysis figures
 
-`analyze_mouse_latents_2d.py` (driven by `scripts/inference_2d.sh`) is the figure
-generator. It writes **five** figures plus one per watershed cluster:
+`analyze_mouse_latents_2d.py` (driven by `scripts/inference_2d.sh`, and by
+`analyze_all_sessions.py` for the full corpus) is the figure generator. It writes three
+figures:
 
 | File | What it is |
 |---|---|
 | `figure_E_embedded_grid.png` | Every latent-space colouring on one grid: mean frequency, SAM mask count, duration, session type (or condition, for legacy sets), emitter sex, social distance, the two social-distance segment overlays, and the aggregated posterior as a reference panel. Panels whose variable the dataset lacks are dropped, so the grid shrinks rather than filling with blank boxes. |
 | `figure_recon_mse.png` | Reconstruction MSE by mask count, by duration bin, by session type, and by session type x mask bin. The last two appear only when the dataset carries a `session_type` column. |
-| `figure_FG_posterior_and_examples.png` | Aggregated posterior with mean-shift centroids, plus one example spectrogram per cluster. |
 | `figure_grid_examples.png` | Decoder output over a `grid_size` x `grid_size` grid of torus cell centres. |
-| `figure_H_watershed_grid.png` | Watershed of the aggregated posterior swept over (smoothing σ, compactness). |
-| `figure_H_cluster_NN_samples.png` | One per cluster: its watershed basin on the posterior, and tile-sampled member spectrograms. |
 
 Alongside them: `recon_mse_breakdown.npz` (raw per-spectrogram numbers — `mse`,
 `mse_in_mask`, `mse_out_mask`, `spec_id`, `mask_counts`, `durations`, `mask_bin`,
-`session_types`, `apply_mask`), `cluster_info.json`, `posterior_cache.npz`, and
+`session_types`, `apply_mask`), `posterior_cache.npz`, and
 `figure_E7_video_*.mp4` when behavioural features are available.
+
+**The driver does not cluster the latent torus.**
+- **Where it happens.** Clustering is done downstream by `scripts/qlvm_latent_clustering`
+  in the MMMmB repo: mean shift, a stitched periodic watershed, and a valley/ridge merge.
+  It writes final per-call labels and figures to
+  `results/qlvm_playpen_runs/inference/<stage>/<phase>/<cell>/clusters/`.
+- **The hand-off.** That package reads `posterior_cache.npz`, which the driver now always
+  writes when it does not cluster.
+- **The old path.** The in-driver clustering floods the flat image, so its basins are cut
+  at the seam. It runs only with `--segment_clusters True` and produces:
+  - mean shift
+  - `figure_FG_posterior_and_examples.png`
+  - `figure_H_watershed_grid.png`
+  - `figure_H_watershed_sweep.png`
+  - `figure_H_cluster_NN_samples.png`
+  - `cluster_info.json`
+- **Flags that only matter on the old path:** `bandwidth`, `use_fast_mean_shift`, `ms_*`,
+  `n_per_cluster`, `cluster_sample_figures`, `watershed_max_clusters` and
+  `sample_from_centroid`. They are still accepted so the existing launchers run unchanged.
+- **Both stages in one command:** `analyze_and_cluster_latents.py`.
+  - `run` calls `analyze_all_sessions` (posterior, cache, decoder grid, figure set,
+    manifest), then clusters in a fresh process.
+  - `cluster` does only the second stage on an existing `save_dir`, taking the model and
+    corpus from its `manifest.json`.
+  - The package is imported from `<MMMmB>/scripts/qlvm_latent_clustering` (override with
+    `QLVM_CLUSTERING_DIR`), so this wrapper needs the monorepo around this checkout.
+  - It reads the frozen parameters from `results/qlvm_playpen_runs/inference/frozen_params.json`.
+  - A results-tree cell is found from its `latent_full_dset` link and written to the
+    canonical `inference/<stage>/<phase>/<cell>/`. Anything else goes to
+    `<save_dir>/latent_clustering/`.
+  - It refuses to write non-frozen parameters into the canonical tree.
+  - `-- --help` lists every flag.
 
 `mse_in_mask` exists because whole-image MSE is not comparable between a masked and an
 unmasked run — a masked target is ~97 % exact zeros, a much easier image to fit. The in-mask
@@ -138,9 +208,12 @@ position on the torus (a histogram, a KD-tree over raw coords) must wrap it firs
 Not wrapping it is what made the aggregated-posterior histogram two points wide and
 turned every watershed run on it into plain Voronoi cells.
 
-`inference_latents.py` / `inference_latents_agg.py` add watershed clustering with
-finer control (n_clusters vs bandwidth); `inference_latents_video.py` renders a
-latent-traversal video from an inference directory.
+`inference_latents.py` / `inference_latents_agg.py` are older drivers that still add
+watershed clustering (n_clusters vs bandwidth). The QLVM playpen runs are clustered by
+`scripts/qlvm_latent_clustering` instead. Its `_qmc.py` imports
+`analysis.clustering.run_mean_shift_fast`, `analysis.watershed_sweep.segment_torus` and
+`inference_latents_agg.toroidal_watershed`, so keep those functions.
+`inference_latents_video.py` renders a latent-traversal video from an inference directory.
 
 ## Latent Space Geometry: Torus Structure and Distances
 
