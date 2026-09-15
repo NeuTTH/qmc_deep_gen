@@ -575,6 +575,10 @@ def analyze_all_sessions(
         bandwidth: Mean-shift bandwidth (0.4). With use_fast_mean_shift the shift
             runs over the LATTICE, not the samples, so its cost does not grow with
             the corpus; only the per-sample nearest-centre assignment does.
+            Used only with ``segment_clusters=True`` (via ``analyze_kwargs``), as are
+            n_per_cluster, sample_from_centroid and use_fast_mean_shift. By default
+            the driver does not cluster; ``scripts/qlvm_latent_clustering`` in the
+            MMMmB repo does, from ``posterior_cache.npz``.
         batch_size: Posterior/metadata dataloader batch size.
         grid_size: Decoder grid figure resolution (grid_size x grid_size).
         n_per_cluster: Example spectrograms per watershed cluster figure.
@@ -734,7 +738,9 @@ def analyze_all_sessions(
             "per_type": {t: r.get("drawn") for t, r in type_report.items()},
         },
         "analysis": dict(settings, n_lattice_points=None),
-        "clusters": {
+        # None unless the driver was asked to cluster (segment_clusters=True); the
+        # clustering lives downstream in MMMmB scripts/qlvm_latent_clustering.
+        "clusters": None if result["centers"] is None else {
             "n_clusters": int(len(result["centers"])),
             "sizes": [int(np.sum(result["labels"] == i)) for i in range(len(result["centers"]))],
             "bandwidth": bandwidth,
@@ -758,7 +764,9 @@ def analyze_all_sessions(
     print(f"  embedded  : {manifest['dataset']['n_embedded']:,} spectrograms "
           f"from {manifest['dataset']['n_sessions']} sessions")
     print(f"  arm       : apply_mask={arm['data_arm']}")
-    print(f"  clusters  : {manifest['clusters']['n_clusters']}")
+    print("  clusters  : "
+          + ("not run here (scripts/qlvm_latent_clustering)" if manifest["clusters"] is None
+             else str(manifest["clusters"]["n_clusters"])))
     print(f"  figures   : {len(figures)}")
     print(f"  wall time : {elapsed / 60:.1f} min")
     print(f"  manifest  : {manifest_path}")

@@ -1,14 +1,21 @@
 """
 Script to generate latent space visualizations for trained mouse vocalization model.
-Reproduces Figure E/F style plots: embedded latents + aggregated posterior with centroids.
+Embeds every spectrogram, writes posterior_cache.npz, and draws the embedding,
+reconstruction and decoder-grid figures.
+
+It does NOT cluster the latent torus. That is done downstream by
+scripts/qlvm_latent_clustering in the MMMmB repo, which reads the posterior_cache.npz
+written here. The old in-driver clustering (mean shift, Figure FG, the Figure-H watershed
+figures, cluster_info.json) runs only with --segment_clusters True, to reproduce old
+figure sets.
 
 Usage:
-    python analyze_mouse_latents.py \
+    python analyze_mouse_latents_2d.py \
         --model_path="path/to/checkpoint.tar" \
         --dataloc="path/to/mouse/data" \
         --save_dir="path/to/save/figures" \
-        --lattice_m=20 \
-        --bandwidth=0.1
+        --lattice_m=24 \
+        --cache_posteriors=True
 """
 
 import torch
@@ -1295,6 +1302,8 @@ def analyze_mouse_latents(
     hi=8,
     apply_mask=None,
     session_conditions=None,
+    # latent clustering: done downstream (MMMmB scripts/qlvm_latent_clustering)
+    segment_clusters=False,
 ):
     """
     Generate latent space analysis figures for mouse vocalization model.
@@ -1304,7 +1313,9 @@ def analyze_mouse_latents(
         dataloc: Path to mouse data directory
         save_dir: Directory to save output figures
         lattice_m: Fibonacci lattice parameter (m=20 gives ~10K points)
-        bandwidth: Bandwidth for mean-shift clustering
+        bandwidth: Bandwidth for mean-shift clustering. Used only with
+            segment_clusters=True, like n_per_cluster, cluster_sample_figures,
+            watershed_max_clusters, sample_from_centroid, use_fast_mean_shift and ms_*.
         batch_size: Batch size for the posterior and metadata dataloaders.
             With a conditional model the posterior batches are drawn grouped by
             conditioning value, so a large batch is now CORRECT as well as fast:
@@ -1329,6 +1340,9 @@ def analyze_mouse_latents(
             was computed against the batch mean, so its contents are wrong rather
             than merely stale -- and accepted for an unconditional one, which never
             had a conditioning value to get wrong. Rows are always in DATASET order.
+            With segment_clusters=False the cache is WRITTEN even when this is False,
+            because it is the input to the downstream clustering; it is only read
+            back when this is True.
         compute_recon: If True, compute round-trip MSE and save bar charts
         recon_batch_size: Batch size for reconstruction MSE computation
         n_dur_bins: Number of duration quantile bins for the bar chart
@@ -1374,6 +1388,15 @@ def analyze_mouse_latents(
         filter_mask: If True, filter dataset to syllables whose masks_len is in [lo, hi].
         lo: Lower bound (inclusive) on masks_len when filter_mask=True.
         hi: Upper bound (inclusive) on masks_len when filter_mask=True.
+        segment_clusters: Cluster the latent torus inside this driver (default False).
+            The clustering is done downstream by ``scripts/qlvm_latent_clustering``
+            in the MMMmB repo: mean shift, a stitched periodic watershed, and a merge
+            of boundaries with no density valley and no decoder ridge. It reads the
+            ``posterior_cache.npz`` written here. True restores the old path, kept
+            only to reproduce old figure sets: mean shift, Figure FG, the Figure-H
+            watershed grid, sweep and per-cluster figures, and ``cluster_info.json``.
+            That path floods the flat image, so its basins are cut at the torus seam.
+            With False the return value's ``centers`` and ``labels`` are None.
     """
 
     # Setup
@@ -1523,7 +1546,9 @@ def analyze_mouse_latents(
             torus_weighted = torus_weighted[posterior_inverse]
             weights = weights[posterior_inverse]
 
-        if cache_posteriors:
+        # Without in-driver clustering the cache is this run's hand-off to
+        # scripts/qlvm_latent_clustering, so it is written regardless.
+        if cache_posteriors or not segment_clusters:
             _write_posterior_cache(cache_path, conditional,
                                    torus_weighted, aggregated, weights)
 
@@ -2102,6 +2127,62 @@ def analyze_mouse_latents(
             tail_times=tail_times_vi,
         )
 
+    # ============= Grid reconstructions =============
+    # Drawn before the clustering block below so they do not depend on it.
+    print("\nGenerating grid reconstructions...")
+    if conditional is not None:
+        # For conditional models generate one grid per sweep value and also a
+        # mean-c grid for a compact single overview.
+        # From data.conditionals, NOT bartul_mouse_cond: the training driver's own
+        # copy of the sweep was the 8-class one, so a 5-class mask_count model got
+        # eight grids, three of them decoded from a c wider than the decoder's c_dim.
+        sweep = conditionals.get_grid_sweep(conditional)
+        for val_label, c_val in sweep:
+            grid_examples(
+                model, grid_size,
+                save_path=os.path.join(save_dir, f'figure_grid_examples_{conditional}_{val_label}.png'),
+                device=device, c=c_val.to(device),
+            )
+        # Also produce a mean-conditioning overview grid
+        fi = conditionals.resolve(conditional)["field_idx"]
+        mean_c = torch.stack([
+            full_ds[i][fi].float() if full_ds[i][fi].dim() > 0 else full_ds[i][fi].float().unsqueeze(0)
+            for i in range(min(500, len(full_ds)))
+        ]).mean(dim=0, keepdim=True).to(device)   # (1, c_dim)
+        grid_examples(model, grid_size,
+                      save_path=os.path.join(save_dir, 'figure_grid_examples.png'),
+                      device=device, c=mean_c)
+    else:
+        grid_examples(model, grid_size,
+                      save_path=os.path.join(save_dir, 'figure_grid_examples.png'),
+                      device=device)
+
+    # ============= Latent clustering: downstream, not here =============
+    # The torus is segmented by scripts/qlvm_latent_clustering in the MMMmB repo, from
+    # the posterior_cache.npz written above: mean shift, a stitched periodic watershed,
+    # then a merge of boundaries with no density valley and no decoder ridge. The
+    # in-driver path below floods the flat image and labels calls by nearest centre,
+    # so its basins are cut at the torus seam. It stays only to reproduce old figure
+    # sets, behind segment_clusters=True.
+    if not segment_clusters:
+        print("\nLatent clustering: not run here (segment_clusters=False).")
+        print("  Cluster downstream from the posterior cache:")
+        print(f"    {cache_path}")
+        print("  with MMMmB scripts/qlvm_latent_clustering/cluster_latents.py run "
+              "<stage>/<phase>/<cell>")
+        print(f"\n=== Analysis Complete ===")
+        print(f"Figures saved to: {save_dir}")
+        return {
+            'latent_coords': latent_coords,
+            'mean_freqs': mean_freqs,
+            'bandwidths': bandwidths,
+            'mask_counts': mask_counts,
+            'centers': None,
+            'labels': None,
+            'social_distances': social_distances,
+            'emitter_sexes': emitter_sexes,
+        }
+
     # ============= FIGURE F: mean-shift centroids over the aggregated posterior ====
     print("\nGenerating Figure F: Aggregated posterior...")
 
@@ -2185,35 +2266,6 @@ def analyze_mouse_latents(
                 dpi=300, bbox_inches='tight')
     print("Saved: figure_FG_posterior_and_examples.png")
     plt.close()
-
-    # ============= Grid reconstructions =============
-    print("\nGenerating grid reconstructions...")
-    if conditional is not None:
-        # For conditional models generate one grid per sweep value and also a
-        # mean-c grid for a compact single overview.
-        # From data.conditionals, NOT bartul_mouse_cond: the training driver's own
-        # copy of the sweep was the 8-class one, so a 5-class mask_count model got
-        # eight grids, three of them decoded from a c wider than the decoder's c_dim.
-        sweep = conditionals.get_grid_sweep(conditional)
-        for val_label, c_val in sweep:
-            grid_examples(
-                model, grid_size,
-                save_path=os.path.join(save_dir, f'figure_grid_examples_{conditional}_{val_label}.png'),
-                device=device, c=c_val.to(device),
-            )
-        # Also produce a mean-conditioning overview grid
-        fi = conditionals.resolve(conditional)["field_idx"]
-        mean_c = torch.stack([
-            full_ds[i][fi].float() if full_ds[i][fi].dim() > 0 else full_ds[i][fi].float().unsqueeze(0)
-            for i in range(min(500, len(full_ds)))
-        ]).mean(dim=0, keepdim=True).to(device)   # (1, c_dim)
-        grid_examples(model, grid_size,
-                      save_path=os.path.join(save_dir, 'figure_grid_examples.png'),
-                      device=device, c=mean_c)
-    else:
-        grid_examples(model, grid_size,
-                      save_path=os.path.join(save_dir, 'figure_grid_examples.png'),
-                      device=device)
 
     # ============= FIGURE H: Random samples per watershed cluster (one fig per cluster) =============
     print("\nGenerating Figure H: Random samples per cluster (watershed σ=3, compact=0)...")
