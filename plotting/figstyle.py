@@ -44,10 +44,16 @@ COND_COLORS = {
     "Lone-Male": SESSION_TYPE_COLORS["lone_male"],
 }
 
-# Aliases seen in the wild: the dataset-construction figures spell the mixed-sex
-# condition ``MF_intact``, and the long labels appear wherever spec_ids were parsed.
+# Aliases seen in the wild: the long labels appear wherever spec_ids were parsed.
+#
+# ``MF_intact`` used to alias onto ``MF`` and no longer does. It was a synonym only
+# while every mixed-sex session in the corpus WAS an intact pair -- true of the
+# 325-session pool, false since the mute-female sessions joined it, where
+# MF = 216,863 but MF_intact = 136,288. The colour is the same either way, so
+# nothing renders differently; the alias is removed so the explicit
+# SESSION_TYPE_COLORS entry is the live one rather than dead code that would lose
+# silently if the two ever diverged.
 _SESSION_TYPE_ALIASES = {
-    "MF_intact": "MF",
     "Male-Female": "MF",
     "Female-Female": "FF",
     "Male-Male": "MM",
