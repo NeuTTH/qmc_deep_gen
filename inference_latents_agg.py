@@ -40,6 +40,7 @@ from tqdm import tqdm
 from analysis.clustering import run_mean_shift_fast
 from analysis.model_helpers import get_posterior_summaries, torus_forward, torus_reverse
 from data.mouse_data import load_full_mouse_data, mouse_data
+from models.qmc_decoder import build_for_checkpoint
 from models.qmc_base import QMCLVM, TorusBasis
 from models.sampling import gen_fib_basis
 from train.losses import binary_lp
@@ -89,21 +90,13 @@ def toroidal_watershed(
 # Model construction
 # ---------------------------------------------------------------------------
 
-def build_model(latent_dim: int, c_dim: int, device: torch.device):
+def build_model(latent_dim: int, c_dim: int, device: torch.device, checkpoint=None):
     """Construct QMCLVM with the fixed decoder architecture used during training."""
-    decoder = nn.Sequential(
-        nn.Linear(2 * latent_dim + c_dim, 2048),
-        nn.Linear(2048, 64 * 8 * 8),
-        nn.Unflatten(1, (64, 8, 8)),
-        nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(16, 8, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(8, 1, 3, stride=2, padding=1, output_padding=1),
-        nn.Sigmoid(),
-    )
+    # Architecture comes from the checkpoint, not from a literal copied out of the
+    # driver: models/qmc_decoder.build_for_checkpoint reads which head the weights
+    # were trained with. This file used to carry its own copy of the Sequential,
+    # one of seven, and every one of them had to be edited in lockstep.
+    decoder, _head = build_for_checkpoint(checkpoint, latent_dim, c_dim=c_dim)
     model = QMCLVM(latent_dim=latent_dim, device=device, decoder=decoder, basis=TorusBasis())
     optimizer = Adam(model.parameters(), lr=1e-3)
     return model, optimizer
@@ -842,7 +835,8 @@ def run_inference(
 
     # ── Model ────────────────────────────────────────────────────────────────
     print('Loading model...')
-    model, optimizer = build_model(latent_dim=2, c_dim=c_dim, device=device)
+    model, optimizer = build_model(latent_dim=2, c_dim=c_dim, device=device,
+                                   checkpoint=model_path)
     model, optimizer, run_info = load(model, optimizer, model_path)
     model.to(device)
     model.eval()

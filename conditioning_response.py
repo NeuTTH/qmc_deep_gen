@@ -46,6 +46,7 @@ import torch.nn as nn
 
 from data import conditionals as C
 from data.mouse_data import _npz_to_data_dict, mouse_data
+from models.qmc_decoder import build_for_checkpoint
 from models.qmc_base import QMCLVM, TorusBasis
 from train.losses import binary_evidence, binary_lp
 from train.model_saving_loading import load
@@ -54,27 +55,17 @@ from train.model_saving_loading import load
 # --------------------------------------------------------------------------- #
 # Model reconstruction
 # --------------------------------------------------------------------------- #
-def build_model(latent_dim, c_dim, device):
-    """Rebuild the decoder exactly as bartul_mouse_cond.py builds it.
+def build_model(latent_dim, c_dim, device, checkpoint):
+    """Rebuild the decoder the checkpoint was trained with.
 
-    Kept as a literal copy rather than an import because this script must be able
-    to load an OLD checkpoint whose driver has since changed shape; pinning the
-    architecture here means a future edit to the driver cannot silently alter
-    what this probe reconstructs.
+    This used to be a literal copy of bartul_mouse_cond.py's Sequential, pinned on
+    purpose so that a later edit to the driver could not silently alter what this
+    probe reconstructs. Reading the architecture out of the CHECKPOINT serves that
+    intent better than pinning did: the weights decide, not the driver and not this
+    file, so an old checkpoint and a ReLU-head one each get the decoder they were
+    trained with. See models/qmc_decoder.py.
     """
-    decoder = nn.Sequential(
-        nn.Linear(2 * latent_dim + c_dim, 2048),
-        nn.Linear(2048, 64 * 8 * 8),
-        nn.Unflatten(1, (64, 8, 8)),
-        nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(16, 8, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(8, 1, 3, stride=2, padding=1, output_padding=1),
-        nn.Sigmoid(),
-    )
+    decoder, _head = build_for_checkpoint(checkpoint, latent_dim, c_dim=c_dim)
     return QMCLVM(latent_dim=latent_dim, device=device, decoder=decoder,
                   basis=TorusBasis())
 
@@ -154,9 +145,9 @@ def conditioning_response(run_dir, n_lattice=256, n_eval=2048,
     print(f"conditional: {C.describe(cond, cfg.get('cond_n_bins', 32))}")
     print(f"device     : {device}\n")
 
-    model = build_model(latent_dim, c_dim, device)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     ckpt = os.path.join(run_dir, "qmc_train_mouse_cond_experiment.tar")
+    model = build_model(latent_dim, c_dim, device, ckpt)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     model, opt, _ = load(model, opt, ckpt)
     model.to(device).eval()
     lattice = _lattices(cfg, n_lattice, device)

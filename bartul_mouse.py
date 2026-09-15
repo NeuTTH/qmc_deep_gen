@@ -40,6 +40,7 @@ The original wildcard imports have been made explicit below.
 """
 
 # --- standard library ---
+import copy
 import json
 import os
 import random
@@ -50,11 +51,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # --- local: models / training ---
 from models.qmc_base import QMCLVM, TorusBasis
+from models.qmc_decoder import build_qmc_decoder, build_for_checkpoint
 from models.sampling import gen_fib_basis, gen_korobov_basis, roberts_sequence
 from train.losses import binary_lp, binary_evidence
 from train.model_saving_loading import load, save
@@ -106,30 +109,83 @@ def print_gpu_memory(label="", compact=False):
 # Validation diagnostics: reconstruction MSE over a fixed val subset
 # ---------------------------------------------------------------------------
 def compute_val_diagnostics(model, val_dataset, base_sequence, lp_fnc, device, indices, diag_batch_size=32):
-    """Compute reconstruction MSE for a fixed set of val indices.
+    """Reconstruction error for a fixed set of val indices, under both readouts.
 
-    Each spectrogram in ``indices`` is round-tripped through the model
-    (lattice posterior -> decoder) and compared to the original; the
-    per-sample mean-squared error is collected. The model is switched to
-    ``eval()`` for the pass and back to ``train()`` afterwards so the caller
-    can keep training.
+    Each spectrogram in ``indices`` is round-tripped through the model and
+    compared to the original. The model is switched to ``eval()`` for the pass and
+    back to ``train()`` afterwards so the caller can keep training.
+
+    WHY TWO READOUTS. ``'posterior'`` decodes at the circular mean of the posterior
+    over the lattice. When the posterior is unimodal that is the mode and the two
+    readouts agree; when a sharper decoder makes it multimodal the mean falls
+    between modes and the reconstruction is scored at a latent no mode occupies.
+    Measured over two seeds, the penalty is 0.0001 for the shipped architecture,
+    0.0006 with the ReLU head and 0.0035 with a K=4 harmonic head -- it appears in
+    proportion to how much the decoder sharpens, which is exactly the axis a
+    capacity change moves along. ``'argmax'`` decodes at the MAP lattice point and
+    carries no such bias, so it is the one to rank architectures on.
+
+    WHY IN-MASK. Overall MSE is 98.6% background on a masked set, where the target
+    is exactly zero and every model scores about 0.0008. The call occupies ~1.4% of
+    the pixels and is the whole quantity of interest. Bracket the in-mask number
+    against two baselines computed on the same val frame rather than reading it
+    raw: the global mean image, which knows no mask, and the true mask filled with
+    the global in-mask mean, which is an oracle. On the phase 2 val set those are
+    0.267 and 0.0494 against a trained model's 0.144.
 
     indices: pre-computed array of dataset indices (balanced across masks_len bins).
-    Returns mse_arr (float32 numpy array of length len(indices)).
+
+    Returns a dict of float32 arrays aligned with ``indices``:
+        'mse'             overall MSE at the 'posterior' readout. UNCHANGED in
+                          meaning, because every qmc_val_diagnostics.npz written
+                          for phases 0 to 4 holds this and the model cards compare
+                          across them.
+        'mse_argmax'      overall MSE at the 'argmax' readout.
+        'mse_in_mask'     in-mask MSE at 'argmax'.
+        'mse_out_mask'    out-of-mask MSE at 'argmax'.
     """
     base_sequence = base_sequence.to(device)
-    all_mse = []
+    out = {k: [] for k in ('mse', 'mse_argmax', 'mse_in_mask', 'mse_out_mask')}
     model.eval()
     with torch.no_grad():
         for start in range(0, len(indices), diag_batch_size):
             batch_idx = indices[start : start + diag_batch_size]
             items = [val_dataset[i] for i in batch_idx]
             specs = torch.stack([it[0] for it in items]).to(torch.float32).to(device)
-            recon = model.round_trip(base_sequence, specs, lp_fnc)
-            mse = ((recon.cpu() - specs.cpu()) ** 2).mean(dim=(1, 2, 3)).numpy()
-            all_mse.extend(mse.tolist())
+            # slot 6 is the raw mask; binarize it the same way __getitem__ does
+            masks = (torch.stack([it[6] for it in items]) > 0.5).unsqueeze(1).to(device)
+
+            recon_post = model.round_trip(base_sequence, specs, lp_fnc)
+            recon_amax = model.round_trip(base_sequence, specs, lp_fnc, recon_type='argmax')
+
+            out['mse'].extend(((recon_post - specs) ** 2).mean(dim=(1, 2, 3)).cpu().tolist())
+            err = (recon_amax - specs) ** 2
+            out['mse_argmax'].extend(err.mean(dim=(1, 2, 3)).cpu().tolist())
+            n_in  = masks.sum(dim=(1, 2, 3)).clamp(min=1)
+            n_out = (~masks).sum(dim=(1, 2, 3)).clamp(min=1)
+            out['mse_in_mask'].extend(((err * masks).sum(dim=(1, 2, 3)) / n_in).cpu().tolist())
+            out['mse_out_mask'].extend(((err * ~masks).sum(dim=(1, 2, 3)) / n_out).cpu().tolist())
     model.train()
-    return np.array(all_mse, dtype=np.float32)
+    return {k: np.array(v, dtype=np.float32) for k, v in out.items()}
+
+
+def val_frame_baselines(val_dataset, indices):
+    """The two numbers an in-mask MSE has to be read against, on this val frame.
+
+    Returns ``(global_mean_image, mask_oracle)``. The first fills every pixel with
+    the dataset's mean image and knows nothing about the mask; the second fills the
+    TRUE mask with the global in-mask mean and is therefore an oracle on the
+    support. A model's in-mask MSE means nothing on its own: what it recovers is
+    the fraction of the distance between them, and that fraction is the only
+    quantity comparable across a change of frame such as a canonicalization.
+    """
+    specs = torch.stack([val_dataset[i][0] for i in indices]).to(torch.float32)
+    masks = (torch.stack([val_dataset[i][6] for i in indices]) > 0.5).unsqueeze(1)
+    mean_image = specs.mean(dim=0, keepdim=True)
+    err = (specs - mean_image) ** 2
+    global_mean = ((err * masks).sum() / masks.sum().clamp(min=1)).item()
+    oracle = specs[masks].var().item()
+    return global_mean, oracle
 
 
 # ---------------------------------------------------------------------------
@@ -266,28 +322,10 @@ def _save_round_trip_panel(dataset, model, base_sequence, lp_fnc, device, save_p
 # ---------------------------------------------------------------------------
 # Model + lattice construction
 # ---------------------------------------------------------------------------
-def build_qmc_decoder(latent_dim):
-    """Build the ConvTranspose2d decoder for the QMCLVM.
-
-    The input width is ``2 * latent_dim`` because ``TorusBasis`` expands each
-    latent coordinate ``z`` to a ``(cos(2*pi*z), sin(2*pi*z))`` pair before
-    decoding. The body is two linear layers up to a 64x8x8 feature map
-    followed by four ConvTranspose2d blocks (64 -> 32 -> 16 -> 8 -> 1, each
-    stride-2 upsampling) and a final Sigmoid so outputs lie in [0, 1].
-    """
-    return nn.Sequential(
-        nn.Linear(2 * latent_dim, 2048),
-        nn.Linear(2048, 64 * 8 * 8),
-        nn.Unflatten(1, (64, 8, 8)),
-        nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(16, 8, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(8, 1, 3, stride=2, padding=1, output_padding=1),
-        nn.Sigmoid(),
-    )
+# The decoder itself now lives in models/qmc_decoder.py, imported above and
+# re-exported here because callers do `from bartul_mouse import build_qmc_decoder`.
+# It used to be a literal copy in seven files; that is what made adding the missing
+# activation a seven-file change rather than a one-line one.
 
 
 def build_lattice_pair(
@@ -451,7 +489,20 @@ def run_mouse_experiments(
     qmc_loss_function = lambda samples, data: binary_evidence(samples, data)
     lp_fnc = lambda x, y: binary_lp(x, y)
 
-    decoder_qmc = build_qmc_decoder(qmc_latent_dim)
+    save_qmc  = os.path.join(save_location, "qmc_train_mouse_experiment.tar")
+    save_diag = os.path.join(save_location, "qmc_val_diagnostics.npz")
+
+    # Head selection, and why it is decided here rather than by a flag. A new run
+    # gets the ReLU head. A run being RE-OPENED gets whatever head its own
+    # checkpoint holds, read out of the state dict, so every phase 0 to 4
+    # checkpoint still loads unchanged and the figures regenerate from it.
+    if os.path.isfile(save_qmc):
+        decoder_qmc, decoder_head = build_for_checkpoint(save_qmc, qmc_latent_dim)
+        print(f"Reopening an existing checkpoint; its decoder head is {decoder_head!r}.")
+    else:
+        decoder_head = "relu"
+        decoder_qmc = build_qmc_decoder(qmc_latent_dim, head=decoder_head)
+        print(f"New run; decoder head is {decoder_head!r}.")
 
     qmc_model = QMCLVM(
         latent_dim=qmc_latent_dim,
@@ -465,9 +516,6 @@ def run_mouse_experiments(
         korobov_a, train_n_points, test_n_points,
         train_grid_m, test_grid_m,
     )
-
-    save_qmc  = os.path.join(save_location, "qmc_train_mouse_experiment.tar")
-    save_diag = os.path.join(save_location, "qmc_val_diagnostics.npz")
 
     # --- pre-calculate fixed val diagnostic indices, balanced across masks_len bins ---
     val_ml_all  = test_loader.dataset.masks_len.numpy()
@@ -483,6 +531,16 @@ def run_mouse_experiments(
     val_diag_dur = val_dur_all[val_diag_indices]
     print(f"Val diagnostic set: {len(val_diag_indices)} samples "
           f"({test_samples_per_mask} per masks_len bin)")
+
+    # The two numbers the in-mask MSE has to be read against on THIS val frame.
+    # Computed once and stamped into the diagnostics, because a canonicalized frame
+    # has a different mask area and a different in-mask variance, and an in-mask
+    # MSE compared across frames without them is meaningless.
+    baseline_global_mean, baseline_mask_oracle = val_frame_baselines(
+        test_loader.dataset, val_diag_indices
+    )
+    print(f"In-mask baselines on this val frame: global mean image "
+          f"{baseline_global_mean:.5f}, mask oracle {baseline_mask_oracle:.5f}")
 
     # small loader over the fixed diagnostic subset — used for val loss and MSE
     val_diag_loader = DataLoader(
@@ -504,9 +562,17 @@ def run_mouse_experiments(
         torch.cuda.reset_peak_memory_stats()
 
         qmc_opt    = Adam(qmc_model.parameters(), lr=1e-3)
+        # Decay the LR when val evidence stops improving, and keep the weights from
+        # the best validation checkpoint rather than whatever the last epoch left.
+        # Across the 24 phase 0 to 4 runs, 12 finished ABOVE their own minimum, by a
+        # median of 0.06% and a worst case of 1.09%; the median run also reached 95%
+        # of its total improvement at 63% of the way through. Neither fact is worth
+        # much on its own, but both are free.
+        qmc_sched = ReduceLROnPlateau(qmc_opt, mode='min', factor=0.5, patience=3)
         qmc_losses = []
         diag_epochs, diag_mse = [], []
-        val_loss_epochs, val_losses = [], []
+        val_loss_epochs, val_losses, lr_trace = [], [], []
+        best_val, best_epoch, best_state = np.inf, None, None
 
         for epoch in tqdm(range(nEpochs)):
             batch_loss, qmc_model, qmc_opt = train_qmc.train_epoch(
@@ -522,16 +588,23 @@ def run_mouse_experiments(
                     test_base_sequence.to(device),
                     qmc_loss_function,
                 )
-                val_losses.append(float(np.mean(val_batch_losses)))
+                val_now = float(np.mean(val_batch_losses))
+                val_losses.append(val_now)
                 val_loss_epochs.append(epoch + 1)
+                qmc_sched.step(val_now)
+                lr_trace.append(qmc_opt.param_groups[0]['lr'])
 
-                mse_arr = compute_val_diagnostics(
+                if val_now < best_val:
+                    best_val, best_epoch = val_now, epoch + 1
+                    best_state = copy.deepcopy(qmc_model.state_dict())
+
+                diag = compute_val_diagnostics(
                     qmc_model, test_loader.dataset,
                     test_base_sequence, lp_fnc, device,
                     val_diag_indices,
                 )
                 diag_epochs.append(epoch + 1)
-                diag_mse.append(mse_arr)
+                diag_mse.append(diag)
 
                 _save_diagnostic_plots(
                     save_location, qmc_losses, val_loss_epochs, val_losses,
@@ -550,17 +623,36 @@ def run_mouse_experiments(
                 print_gpu_memory(f"epoch {epoch+1}", compact=True)
 
         print_gpu_memory("after training")
+        # The checkpoint is the best-validation one, not the last one. The loss
+        # trace and the diagnostics still cover every epoch, and `best_epoch` says
+        # which of them the saved weights correspond to.
+        if best_state is not None and best_epoch != val_loss_epochs[-1]:
+            print(f"Restoring the epoch-{best_epoch} weights "
+                  f"(val {best_val:.2f}) over the epoch-{val_loss_epochs[-1]} ones "
+                  f"(val {val_losses[-1]:.2f}).")
+            qmc_model.load_state_dict(best_state)
         save(qmc_model.to("cpu"), qmc_opt, qmc_losses, fn=save_qmc)
         qmc_model.to(device)
         np.savez(
             save_diag,
             epochs=np.array(diag_epochs),
-            mse=np.array(diag_mse),
+            # 'mse' keeps its phase 0 to 4 meaning: overall MSE at the 'posterior'
+            # readout. The argmax and in-mask columns are additions beside it.
+            mse=np.array([d['mse'] for d in diag_mse]),
+            mse_argmax=np.array([d['mse_argmax'] for d in diag_mse]),
+            mse_in_mask=np.array([d['mse_in_mask'] for d in diag_mse]),
+            mse_out_mask=np.array([d['mse_out_mask'] for d in diag_mse]),
             val_diag_ml=val_diag_ml,
             val_diag_dur=val_diag_dur,
             dur_bin_edges=dur_bin_edges,
             val_loss_epochs=np.array(val_loss_epochs),
             val_losses=np.array(val_losses),
+            lr_trace=np.array(lr_trace),
+            best_epoch=np.array(best_epoch if best_epoch is not None else -1),
+            best_val_loss=np.array(best_val),
+            decoder_head=np.array(decoder_head),
+            baseline_global_mean=np.array(baseline_global_mean),
+            baseline_mask_oracle=np.array(baseline_mask_oracle),
         )
     else:
         qmc_opt = Adam(qmc_model.parameters(), lr=1e-3)

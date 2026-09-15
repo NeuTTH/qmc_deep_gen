@@ -30,6 +30,7 @@ from torch.optim import Adam
 from tqdm import tqdm
 import fire
 
+from models.qmc_decoder import build_for_checkpoint
 from models.qmc_base import QMCLVM, TorusBasis
 from models.vae_base import VAE, Encoder
 from models.sampling import gen_fib_basis
@@ -43,20 +44,12 @@ from analysis.jacobians import get_norms_lattice
 
 # ── Architecture helpers ─────────────────────────────────────────────────────
 
-def build_qmc_model(latent_dim, device):
-    decoder = nn.Sequential(
-        nn.Linear(2 * latent_dim, 2048),
-        nn.Linear(2048, 64 * 8 * 8),
-        nn.Unflatten(1, (64, 8, 8)),
-        nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(16, 8, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(8, 1, 3, stride=2, padding=1, output_padding=1),
-        nn.Sigmoid(),
-    )
+def build_qmc_model(latent_dim, device, checkpoint):
+    # Architecture comes from the checkpoint, not from a literal copied out of the
+    # driver: models/qmc_decoder.build_for_checkpoint reads which head the weights
+    # were trained with. This file used to carry its own copy of the Sequential,
+    # one of seven, and every one of them had to be edited in lockstep.
+    decoder, _head = build_for_checkpoint(checkpoint, latent_dim)
     return QMCLVM(latent_dim=latent_dim, device=device, decoder=decoder, basis=TorusBasis())
 
 
@@ -320,7 +313,7 @@ def compare_qmc_vae_mouse(
 
     # ── QMC model ─────────────────────────────────────────────────────────────
     print("\nLoading QMC model...")
-    qmc_model = build_qmc_model(qmc_latent_dim, device)
+    qmc_model = build_qmc_model(qmc_latent_dim, device, checkpoint=qmc_model_path)
     qmc_opt = Adam(qmc_model.parameters(), lr=1e-3)
     qmc_model, qmc_opt, _ = load(qmc_model, qmc_opt, qmc_model_path)
     qmc_model.to(device).eval()

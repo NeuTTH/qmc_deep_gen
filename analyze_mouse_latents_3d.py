@@ -24,6 +24,7 @@ import fire
 from tqdm import tqdm
 from torch.optim import Adam
 
+from models.qmc_decoder import build_for_checkpoint
 from models.qmc_base import QMCLVM, TorusBasis
 from models.sampling import roberts_sequence, gen_korobov_basis
 from train.model_saving_loading import load
@@ -250,19 +251,8 @@ def analyze_mouse_latents_3d(
     # ── Model ──────────────────────────────────────────────────────────────
     print('Loading model...')
     latent_dim = 3
-    decoder = nn.Sequential(
-        nn.Linear(2 * latent_dim, 2048),
-        nn.Linear(2048, 64 * 8 * 8),
-        nn.Unflatten(1, (64, 8, 8)),
-        nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(16, 8, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(8, 1, 3, stride=2, padding=1, output_padding=1),
-        nn.Sigmoid(),
-    )
+    # Architecture comes from the checkpoint; see models/qmc_decoder.py.
+    decoder, _head = build_for_checkpoint(model_path, latent_dim)
     model = QMCLVM(latent_dim=latent_dim, device=device, decoder=decoder, basis=TorusBasis())
     optimizer = Adam(model.parameters(), lr=1e-3)
     model, optimizer, _ = load(model, optimizer, model_path)

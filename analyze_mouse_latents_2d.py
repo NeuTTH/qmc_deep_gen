@@ -21,6 +21,7 @@ import os
 import fire
 from tqdm import tqdm
 
+from models.qmc_decoder import build_for_checkpoint
 from models.qmc_base import QMCLVM, TorusBasis
 from models.sampling import gen_fib_basis
 from train.model_saving_loading import load
@@ -1442,20 +1443,11 @@ def analyze_mouse_latents(
 
     # Architecture must match training (bartul_mouse.py or bartul_mouse_cond.py).
     # When a conditional is used, the first linear layer is widened by c_dim.
-    import torch.nn as nn
-    decoder = nn.Sequential(
-        nn.Linear(2*latent_dim + c_dim, 2048),
-        nn.Linear(2048, 64*8*8),
-        nn.Unflatten(1, (64, 8, 8)),
-        nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(16, 8, 3, stride=2, padding=1, output_padding=1),
-        nn.ReLU(),
-        nn.ConvTranspose2d(8, 1, 3, stride=2, padding=1, output_padding=1),
-        nn.Sigmoid(),
-    )
+    # Architecture comes from the checkpoint rather than a literal copied out of
+    # the driver: build_for_checkpoint reads which head the weights were trained
+    # with, so a phase 0 to 4 checkpoint and a ReLU-head one both load here.
+    decoder, decoder_head = build_for_checkpoint(model_path, latent_dim, c_dim=c_dim)
+    print(f"Decoder head from the checkpoint: {decoder_head!r}")
 
     model = QMCLVM(latent_dim=latent_dim, device=device, decoder=decoder, basis=TorusBasis())
     optimizer = Adam(model.parameters(), lr=1e-3)
