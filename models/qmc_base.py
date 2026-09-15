@@ -184,9 +184,18 @@ class QMCLVM(nn.Module):
             if 'argmax' in recon_type:
                 """
                 same if we do in image space vs. latent space
+
+                One MAP lattice point PER ROW. `torch.argmax(posterior)` with no
+                `dim` flattens the B x m posterior and returns a single index into
+                the whole matrix, which is row 0's argmax when B == 1 and an index
+                past the end of `grid` for almost any B > 1 -- an IndexError rather
+                than a silently wrong reconstruction, which is why no result in the
+                repo was ever affected. Nothing in the mouse pipeline asked for
+                'argmax': the training diagnostics and the analyzer both take the
+                default 'posterior'.
                 """
 
-                posterior_grid = grid[torch.argmax(posterior)][None,:] % 1
+                posterior_grid = grid[torch.argmax(posterior, dim=1)] % 1
 
                 recon = self.forward(posterior_grid,random=False,mod=False,c=c)
 
